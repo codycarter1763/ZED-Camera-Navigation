@@ -94,7 +94,7 @@ MAP_W      = 620
 MAP_H      = 560
 MAP_CX     = MAP_X + MAP_W // 2   # center of map panel
 MAP_CY     = MAP_Y + MAP_H // 2
-SCALE      = 25   # pixels per meter
+SCALE      = 12   # pixels per meter
 
 def world_to_screen(x, z):
     sx = int(MAP_CX + x * SCALE)
@@ -170,14 +170,14 @@ while running:
     pygame.draw.rect(screen, GRID, (MAP_X, MAP_Y, MAP_W, MAP_H), 1)
     
     # ── Grid dots ─────────────────────────────────────────────
-    for gx in range(-20, 21):
-        for gz in range(-20, 20):
+    for gx in range(-40, 41):
+        for gz in range(-40, 40):
             sx, sy = world_to_screen(gx, gz)
             if MAP_X < sx < MAP_X + MAP_W and MAP_Y < sy < MAP_Y + MAP_H:
                 pygame.draw.circle(screen, GRID, (sx, sy), 2)
 
     # Axis labels (meter marks)
-    for m in range(-20, 21, 2):
+    for m in range(-40, 41, 5):
         sx, sy = world_to_screen(m, 0)
         if MAP_X < sx < MAP_X + MAP_W:
             lbl = font_sm.render(f"{m}m", True, GRID)
