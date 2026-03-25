@@ -168,7 +168,7 @@ while running:
 
     # Map panel border
     pygame.draw.rect(screen, GRID, (MAP_X, MAP_Y, MAP_W, MAP_H), 1)
-
+    
     # ── Grid dots ─────────────────────────────────────────────
     for gx in range(-20, 21):
         for gz in range(-20, 20):
