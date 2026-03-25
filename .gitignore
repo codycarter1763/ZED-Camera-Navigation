@@ -1,0 +1,23 @@
+# Large generated files - regenerated each mission
+rover_home.area
+rover_home.obj
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code settings
+.vscode/
+
+# Windows system files
+Thumbs.db
+desktop.ini
+
+# Byte compiled files
+*.pyd
+
+# ZED SDK generated files
+*.svo
+*.svo2
+*.zed
