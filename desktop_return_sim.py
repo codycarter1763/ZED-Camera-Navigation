@@ -24,6 +24,7 @@ import os
 import threading
 import math
 import subprocess
+from pymavlink import mavutil
 
 # ── Check files exist ─────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +42,30 @@ T0 = np.array([origin["x"], origin["y"], origin["z"]])
 print("Origin loaded:")
 print(f"  X: {T0[0]:.3f}  Y: {T0[1]:.3f}  Z: {T0[2]:.3f}")
 
+# ── MAVLink connection to Pixhawk via UART ────────────────────
+# Jetson UART ports (pick the one wired to Pixhawk TELEM2):
+#   /dev/ttyTHS0  — UART0  (40-pin header, pins 8/10)
+#   /dev/ttyTHS1  — UART1
+#   /dev/ttyTHS2  — UART2  (most common for Pixhawk TELEM2)
+# Pixhawk TELEM2 default baud is 921600.
+# Match SERIAL2_BAUD in ArduPilot params to this value.
+MAV_CONNECT = '/dev/ttyTHS2'
+MAV_BAUD    = 921600
+
+print(f"Connecting to Pixhawk via UART {MAV_CONNECT} @ {MAV_BAUD}...")
+try:
+    mav = mavutil.mavlink_connection(MAV_CONNECT, baud=MAV_BAUD)
+    mav.wait_heartbeat(timeout=5)
+    print(f"Pixhawk connected — system {mav.target_system} "
+          f"component {mav.target_component}")
+except Exception as e:
+    print(f"WARNING: Pixhawk connection failed: {e}")
+    print("Continuing without MAVLink — velocity commands will be skipped")
+    mav = None
+
+current_flight_mode = "UNKNOWN"
+last_heartbeat_time = time.time()
+
 # ── Shared state (thread safe) ────────────────────────────────
 class SharedState:
     def __init__(self):
@@ -54,6 +79,7 @@ class SharedState:
         self.pose_received     = False
         self.land_activated    = False
         self.apriltag_process  = None
+        self.last_pose_time = 0.0
 
 state = SharedState()
 
@@ -87,10 +113,12 @@ class ReturnSimNode(Node):
 
     def pose_callback(self, msg):
         pos = msg.pose.position
+        state.last_pose_time = time.time()
         with state.lock:
             state.current_pos   = np.array([pos.x, pos.y, pos.z])
             state.pose_received = True
 
+            
             # Auto switch phase when close to home
             # and land has been activated
             dist = float(np.linalg.norm(state.current_pos - T0))
@@ -247,20 +275,166 @@ def activate_landing():
     if ros_node is not None:
         ros_node.publish_land_command()
 
+# ── MAVLink helpers ───────────────────────────────────────────
+def send_velocity_ned(vx, vy, vz, yaw_rate=0.0):
+    """
+    Send body-frame velocity setpoint to Pixhawk over UART.
+    vx = forward/North (m/s)
+    vy = right/East    (m/s)
+    vz = down          (m/s, positive = descend)
+    Must be called at ~10Hz to keep ArduPilot GUIDED mode active.
+    """
+    if mav is None:
+        return
+    mav.mav.set_position_target_local_ned_send(
+        0,                              # time_boot_ms (unused)
+        mav.target_system,
+        mav.target_component,
+        mavutil.mavlink.MAV_FRAME_BODY_NED,
+        0b0000_1111_1100_0111,          # typemask: velocity only
+        0, 0, 0,                        # x, y, z position (ignored)
+        vx, vy, vz,                     # velocity setpoints (m/s)
+        0, 0, 0,                        # acceleration (ignored)
+        0, yaw_rate                     # yaw, yaw_rate
+    )
+
+def send_land_command():
+    """Tell Pixhawk to execute LAND mode via MAVLink over UART."""
+    if mav is None:
+        print("WARNING: MAVLink not connected — cannot send land command")
+        return
+    mav.mav.command_long_send(
+        mav.target_system,
+        mav.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,          # confirmation
+        0, 0, 0, 0, # params 1-4 unused
+        0, 0, 0     # lat, lon, alt (0 = land at current position)
+    )
+    print("MAV_CMD_NAV_LAND sent to Pixhawk via UART")
+
+# ── MAVLink command thread ────────────────────────────────────
+# Runs at 10Hz — sends velocity commands to Pixhawk based on phase.
+# ArduPilot GUIDED mode times out after ~1s without a fresh command,
+# so this thread must keep refreshing at 10Hz while flying.
+SPEED     = 1.5   # m/s cruise speed toward home (Phase 1)
+TAG_GAIN  = 0.8   # proportional gain for AprilTag corrections (Phase 2)
+DEADBAND  = 0.05  # 5cm — matches landing_controller.py
+LAND_DIST = 0.30  # begin descent when tag is closer than this (m)
+
+def clamp(v, max_v):
+    return max(-max_v, min(max_v, v))
+
+def mavlink_thread():
+    global current_flight_mode, last_heartbeat_time
+
+    land_sent = False
+
+    def clamp(v, max_v):
+        return max(-max_v, min(max_v, v))
+
+    while True:
+        time.sleep(0.1)  # 10 Hz
+
+        # ── MAVLink heartbeat (non-blocking) ─────────────────
+        msg = mav.recv_match(type='HEARTBEAT', blocking=False) if mav else None
+        if msg:
+            current_flight_mode = mav.flightmode
+            last_heartbeat_time = time.time()
+
+        # ── Heartbeat failsafe ───────────────────────────────
+        if mav and (time.time() - last_heartbeat_time > 1.0):
+            print("WARNING: MAVLink heartbeat lost — stopping control")
+            continue
+
+        # ── Respect operator control (Mission Planner) ───────
+        if mav and current_flight_mode != "GUIDED":
+            # Operator switched to RTL, LOITER, etc.
+            continue
+
+        # ── Read shared state safely ─────────────────────────
+        with state.lock:
+            phase        = state.phase
+            land_active  = state.land_activated
+            tag_visible  = state.tag_detected
+            x_off        = state.tag_x_offset
+            y_off        = state.tag_y_offset
+            tag_dist     = state.tag_distance
+            cur          = state.current_pos.copy()
+            pose_ok      = state.pose_received
+            last_pose_ts = getattr(state, "last_pose_time", 0.0)
+
+        # ── Pose failsafe (timeout-based) ────────────────────
+        if not pose_ok or (time.time() - last_pose_ts > 0.5):
+            print("WARNING: Pose lost/stale — holding position")
+            send_velocity_ned(0.0, 0.0, 0.0)
+            continue
+
+        # ── Do nothing until landing is activated ────────────
+        if not land_active:
+            continue
+
+        # ── Phase 1 — Navigate toward home ───────────────────
+        if phase == 1:
+            delta = T0 - cur
+            horiz = math.sqrt(delta[0]**2 + delta[2]**2)
+
+            if horiz > 0.1:
+                vx = clamp(SPEED * delta[2] / horiz, 1.0)  # North
+                vy = clamp(SPEED * delta[0] / horiz, 1.0)  # East
+                vz = 0.0
+            else:
+                vx, vy, vz = 0.0, 0.0, 0.0
+
+            send_velocity_ned(vx, vy, vz)
+
+        # ── Phase 2 — AprilTag precision landing ─────────────
+        elif phase == 2:
+            if tag_visible:
+                vx = clamp(TAG_GAIN * y_off, 0.5)
+                vy = clamp(TAG_GAIN * x_off, 0.5)
+
+                z_err = tag_dist - LAND_DIST
+                vz = clamp(TAG_GAIN * z_err, 0.3) if abs(z_err) > DEADBAND else 0.0
+
+                send_velocity_ned(vx, vy, vz)
+            else:
+                # Tag lost → hold position
+                send_velocity_ned(0.0, 0.0, 0.0)
+
+        # ── Phase 3 — Land and release control ───────────────
+        elif phase == 3:
+            if not land_sent:
+                send_land_command()
+                land_sent = True
+                print("Landing initiated — releasing control to autopilot")
+
+            # STOP sending velocity commands after LAND
+            continue
+
+mav_thread = threading.Thread(target=mavlink_thread, daemon=True)
+mav_thread.start()
+
 # ── Main loop ─────────────────────────────────────────────────
 running = True
 while running:
 
     # ── Get state thread safely ───────────────────────────────
     with state.lock:
-        current_pos   = state.current_pos.copy()
-        pose_received = state.pose_received
-        tag_detected  = state.tag_detected
-        tag_x_offset  = state.tag_x_offset
-        tag_y_offset  = state.tag_y_offset
-        tag_distance  = state.tag_distance
-        phase         = state.phase
-        land_active   = state.land_activated
+        phase       = state.phase
+        land_active = state.land_activated
+        tag_visible = state.tag_detected
+        x_off       = state.tag_x_offset
+        y_off       = state.tag_y_offset
+        tag_dist    = state.tag_distance
+        cur         = state.current_pos.copy()
+        pose_ok     = state.pose_received
+
+    # ── Pose failsafe ──
+    if not pose_ok:
+        print("WARNING: No pose — holding position")
+        send_velocity_ned(0.0, 0.0, 0.0)
+        continue
 
     # ── Events ────────────────────────────────────────────────
     for event in pygame.event.get():
@@ -392,6 +566,12 @@ while running:
     if phase == 3:
         msg = font_lg.render("LAND NOW!", True, TAG_COL)
         screen.blit(msg, (MAP_X + MAP_W//2 - 70, MAP_Y + 20))
+
+    # MAVLink status indicator (bottom of left panel)
+    mav_text  = "UART OK ✓" if mav is not None else "UART DISCONNECTED"
+    mav_color = HOME_COL    if mav is not None else WARN_COL
+    surf = font_sm.render(mav_text, True, mav_color)
+    screen.blit(surf, (15, H - 25))
 
     # ── Left panel HUD ────────────────────────────────────────
     phase_color = (TAG_COL    if phase == 3
