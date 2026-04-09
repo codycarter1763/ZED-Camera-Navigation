@@ -10,11 +10,11 @@
 #   C — clear trail
 #   Q — quit
 
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-from apriltag_msgs.msg import AprilTagDetectionArray
-from std_msgs.msg import Bool
+# import rclpy
+# from rclpy.node import Node
+# from geometry_msgs.msg import PoseStamped
+# from apriltag_msgs.msg import AprilTagDetectionArray
+# from std_msgs.msg import Bool
 
 import json
 import numpy as np
@@ -49,8 +49,8 @@ print(f"  X: {T0[0]:.3f}  Y: {T0[1]:.3f}  Z: {T0[2]:.3f}")
 #   /dev/ttyTHS2  — UART2  (most common for Pixhawk TELEM2)
 # Pixhawk TELEM2 default baud is 921600.
 # Match SERIAL2_BAUD in ArduPilot params to this value.
-MAV_CONNECT = '/dev/ttyTHS2'
-MAV_BAUD    = 921600
+MAV_CONNECT = 'udp:127.0.0.1:14550'
+MAV_BAUD = 115200
 
 print(f"Connecting to Pixhawk via UART {MAV_CONNECT} @ {MAV_BAUD}...")
 try:
