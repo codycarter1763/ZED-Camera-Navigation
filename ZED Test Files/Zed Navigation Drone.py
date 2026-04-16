@@ -31,7 +31,7 @@ from std_msgs.msg import Bool
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 ORIGIN_FILE = os.path.join(SCRIPT_DIR, "origin_T0.json")
  
-MAV_CONNECT = 'udp:127.0.0.1:14550'   # swap to '/dev/ttyTHS2' for UART
+MAV_CONNECT = '/dev/ttyACM0'
 MAV_BAUD    = 115200
  
 TAG_ID      = 0
@@ -150,6 +150,9 @@ class LandNode(Node):
                     S.tag_x      = px_x / ppm
                     S.tag_y      = px_y / ppm
                     S.tag_dist   = (TAG_SIZE * FOCAL_LEN) / w_px
+                    print(f"DEBUG tag_x:{S.tag_x:.3f} tag_y:{S.tag_y:.3f} dist:{S.tag_dist:.3f} w_px:{w_px:.1f}")
+                    print(f"DEBUG need x<{DEADBAND} y<{DEADBAND} dist<{LAND_DIST}")
+                    print(f"DEBUG pass: x={abs(S.tag_x)<DEADBAND} y={abs(S.tag_y)<DEADBAND} dist={S.tag_dist<LAND_DIST}")
                 else:
                     S.tag_x = S.tag_y = S.tag_dist = 0.0
                 # Phase 2→3: aligned and close
