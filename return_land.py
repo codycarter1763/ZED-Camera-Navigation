@@ -651,6 +651,7 @@
 
 import json, math, os, sys, threading, time
 import struct
+import subprocess
 import numpy as np
 import pygame
 from pymavlink import mavutil
@@ -662,6 +663,7 @@ from geometry_msgs.msg import PoseStamped, PointStamped
 from apriltag_msgs.msg import AprilTagDetectionArray
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
+from mavros_msgs.msg import StatusText
 
 # ══════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -899,11 +901,26 @@ class LandNode(Node):
         # Publishers
         self._land_pub    = self.create_publisher(Bool,         '/land_command',        10)
         self._tag_pos_pub = self.create_publisher(PointStamped, '/apriltag_global_pos',  10)
+        self._status_pub  = self.create_publisher(StatusText,   '/mavros/statustext/send', 10)
+
+        # Listen for GUI trigger commands via MAVROS statustext
+        # Route: GUI → Mission Planner → Pixhawk USB → MAVROS → here
+        self.create_subscription(
+            StatusText,
+            '/mavros/statustext/recv',
+            self._statustext_cb,
+            10)
+
+        # Track apriltag subprocess
+        self._apriltag_proc = None
 
         self.get_logger().info('LandNode ready')
         self.get_logger().info(f'Pose:    {ZED_POSE_TOPIC}')
         self.get_logger().info(f'Depth:   {ZED_DEPTH_TOPIC}')
         self.get_logger().info(f'AprilTag:{APRILTAG_TOPIC}')
+        self.get_logger().info(
+            'Listening for GUI commands on '
+            '/mavros/statustext/recv')
 
     # ── Pose callback ─────────────────────────────────────────
     def _pose_cb(self, msg):
@@ -1059,6 +1076,96 @@ class LandNode(Node):
         pt.point.y = 0.0
         pt.point.z = z
         self._tag_pos_pub.publish(pt)
+
+    def _statustext_cb(self, msg):
+        """
+        Receive trigger commands from GUI via MAVLink STATUSTEXT.
+        Route: GUI → Mission Planner → Pixhawk USB → MAVROS → here
+        Commands: CLARQ_LAND, CLARQ_START_TAG, CLARQ_STOP_TAG, CLARQ_PING
+        """
+        text = msg.text.strip()
+        self.get_logger().info(f'GUI command received: {text}')
+
+        if text == "CLARQ_PING":
+            reply          = StatusText()
+            reply.severity = 6
+            reply.text     = "CLARQ_PONG"
+            self._status_pub.publish(reply)
+            self.get_logger().info('Ping received — pong sent')
+
+        elif text == "CLARQ_LAND":
+            self.get_logger().info(
+                'CLARQ_LAND — activating landing sequence!')
+            with S.lock:
+                if not S.land_active and S.pose_ok:
+                    S.land_active    = True
+                    S.auto_activated = False
+                    self.get_logger().info(
+                        'Landing activated by GUI')
+                    threading.Thread(
+                        target=switch_to_guided,
+                        daemon=True).start()
+                    threading.Thread(
+                        target=self._start_apriltag,
+                        daemon=True).start()
+                elif not S.pose_ok:
+                    self.get_logger().warn(
+                        'Cannot activate — no ZED pose yet')
+                else:
+                    self.get_logger().warn(
+                        'Landing already active')
+
+        elif text == "CLARQ_START_TAG":
+            threading.Thread(
+                target=self._start_apriltag,
+                daemon=True).start()
+
+        elif text == "CLARQ_STOP_TAG":
+            self._stop_apriltag()
+
+    def _start_apriltag(self):
+        """Start apriltag_ros node if not already running"""
+        if (self._apriltag_proc is not None and
+                self._apriltag_proc.poll() is None):
+            self.get_logger().info(
+                'AprilTag node already running')
+            return
+
+        self.get_logger().info('Starting AprilTag node...')
+        tags_cfg = os.path.expanduser(
+            '~/ZED Navigation/ZED-Camera-Navigation/'
+            'tags_config.yaml')
+        self._apriltag_proc = subprocess.Popen([
+            'bash', '-c',
+            'source /opt/ros/humble/setup.bash && '
+            'source ~/ros2_ws/install/setup.bash && '
+            'ros2 run apriltag_ros apriltag_node --ros-args '
+            '-r image_rect:='
+            '/zed/zed_node/rgb/color/rect/image '
+            '-r camera_info:='
+            '/zed/zed_node/rgb/color/rect/camera_info '
+            f'--params-file {tags_cfg}'
+        ])
+        time.sleep(2)
+        if self._apriltag_proc.poll() is None:
+            self.get_logger().info('AprilTag node running!')
+            reply          = StatusText()
+            reply.severity = 6
+            reply.text     = "CLARQ_TAG_RUNNING"
+            self._status_pub.publish(reply)
+        else:
+            self.get_logger().error(
+                'AprilTag node failed to start!')
+
+    def _stop_apriltag(self):
+        """Stop apriltag_ros node"""
+        if (self._apriltag_proc is not None and
+                self._apriltag_proc.poll() is None):
+            self._apriltag_proc.terminate()
+            self._apriltag_proc = None
+            self.get_logger().info('AprilTag node stopped')
+        else:
+            self.get_logger().warn('AprilTag not running')
 
     def publish_land_cmd(self):
         msg = Bool(); msg.data = True

@@ -1,4 +1,4 @@
-# drone_gui.py
+# CLARQ_GUI.py
 # Runs on Windows alongside Mission Planner
 # Sends MAVLink commands directly to Pixhawk via UDP from Mission Planner
 # pip install pymavlink
@@ -11,6 +11,13 @@ import time
 
 # ── Config ────────────────────────────────────────────────────
 MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
+
+# ── Jetson trigger commands via MAVLink STATUSTEXT ────────────
+# Route: GUI → Mission Planner → Pixhawk USB → MAVROS → Jetson
+CMD_START_LANDING  = "CLARQ_LAND"
+CMD_START_APRILTAG = "CLARQ_START_TAG"
+CMD_STOP_APRILTAG  = "CLARQ_STOP_TAG"
+CMD_PING           = "CLARQ_PING"
 
 # ── Colors ────────────────────────────────────────────────────
 BG     = "#0f0f16"
@@ -27,7 +34,7 @@ PURPLE = "#4a1a6b"
 class DroneGUI:
     def __init__(self, root):
         self.root      = root
-        self.root.title("Drone MAVLink Control")
+        self.root.title("CLARQ Drone Control")
         self.root.geometry("1000x700")
         self.root.configure(bg=BG)
 
@@ -40,13 +47,12 @@ class DroneGUI:
     # ── UI ────────────────────────────────────────────────────
     def build_ui(self):
 
-        # Title bar
         title = tk.Frame(self.root, bg=PANEL, pady=12)
         title.pack(fill=tk.X)
 
         tk.Label(
             title,
-            text="DRONE MAVLINK CONTROL",
+            text="CLARQ DRONE NAVIGATION CONTROL",
             font=("Consolas", 16, "bold"),
             bg=PANEL, fg=ACCENT
         ).pack(side=tk.LEFT, padx=20)
@@ -59,7 +65,6 @@ class DroneGUI:
         )
         self.conn_label.pack(side=tk.RIGHT, padx=20)
 
-        # Main layout
         main = tk.Frame(self.root, bg=BG)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -97,7 +102,6 @@ class DroneGUI:
         left_canvas.bind("<MouseWheel>", on_mousewheel)
         left.bind("<MouseWheel>", on_mousewheel)
 
-        # ── Right panel ───────────────────────────────────────
         right = tk.Frame(main, bg=PANEL)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -218,20 +222,21 @@ class DroneGUI:
         section("ARM / DISARM")
 
         self.arm_btn = btn(
-            "ARM",    GREEN, self.arm,    tk.DISABLED)
+            "ARM",       GREEN, self.arm,       tk.DISABLED)
         self.disarm_btn = btn(
-            "DISARM", RED,   self.disarm, tk.DISABLED)
+            "DISARM",    RED,   self.disarm,    tk.DISABLED)
+        self.force_arm_btn = btn(
+            "FORCE ARM", WARN,  self.force_arm, tk.DISABLED)
 
         # ── Commands ──────────────────────────────────────────
         section("COMMANDS")
 
         self.cmd_btns = []
         commands = [
-            ("TAKEOFF 2m",        BLUE,   self.takeoff),
-            ("TAKEOFF 5m",        BLUE,   self.takeoff_5),
-            ("TAKEOFF 10m",       BLUE,   self.takeoff_10),
-            ("RETURN TO LAUNCH",  WARN,   self.rtl),
-            ("ACTIVATE LANDING",  PURPLE, self.activate_landing),
+            ("TAKEOFF 2m",       BLUE, self.takeoff),
+            ("TAKEOFF 5m",       BLUE, self.takeoff_5),
+            ("TAKEOFF 10m",      BLUE, self.takeoff_10),
+            ("RETURN TO LAUNCH", WARN, self.rtl),
         ]
         for text, color, cmd in commands:
             b = btn(text, color, cmd, tk.DISABLED)
@@ -242,14 +247,14 @@ class DroneGUI:
 
         self.prec_btns = []
         prec_commands = [
-            ("ENABLE PREC LAND",  GREEN, self.enable_prec_land),
-            ("DISABLE PREC LAND", RED,   self.disable_prec_land),
+            ("START PREC LAND", GREEN, self.start_precision_landing),
+            ("STOP PREC LAND",  RED,   self.stop_precision_landing),
+            ("PING JETSON",     BLUE,  self.ping_jetson),
         ]
         for text, color, cmd in prec_commands:
             b = btn(text, color, cmd, tk.DISABLED)
             self.prec_btns.append(b)
 
-        # Bottom padding
         tk.Frame(parent, bg=PANEL, height=20).pack()
 
     def build_output(self, parent):
@@ -340,6 +345,7 @@ class DroneGUI:
             b.config(state=tk.NORMAL)
         self.arm_btn.config(state=tk.NORMAL)
         self.disarm_btn.config(state=tk.NORMAL)
+        self.force_arm_btn.config(state=tk.NORMAL)
 
     # ── Connection ────────────────────────────────────────────
     def connect(self):
@@ -350,16 +356,33 @@ class DroneGUI:
                 self.mav = mavutil.mavlink_connection(conn)
                 self.log("Waiting for heartbeat...", "dim")
                 self.mav.wait_heartbeat(timeout=10)
+
+                # Always target the Pixhawk (system 1)
+                # not Mission Planner (system 255)
+                self.mav.target_system    = 1
+                self.mav.target_component = 1
+
                 self.connected = True
                 self.log(
-                    f"Connected! "
-                    f"System {self.mav.target_system} "
-                    f"Component {self.mav.target_component}",
+                    f"Connected! Targeting system 1 (Pixhawk)",
                     "info")
+
+                # Request all data streams from Pixhawk at 4 Hz
+                # This is required for real hardware —
+                # SITL sends data automatically but real Pixhawk needs asking
+                self.mav.mav.request_data_stream_send(
+                    1, 1,
+                    mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                    4,   # 4 Hz
+                    1    # start streaming
+                )
+                self.log("Data streams requested at 4Hz", "dim")
+
                 self.root.after(0, lambda: self.conn_label.config(
                     text="● CONNECTED", fg=ACCENT))
                 self.root.after(0, self.enable_buttons)
                 self.start_telemetry()
+
             except Exception as e:
                 self.log(f"Connection failed: {e}", "error")
 
@@ -394,6 +417,12 @@ class DroneGUI:
                 )
                 if msg is None:
                     continue
+
+                # Only process messages from Pixhawk (system 1)
+                # ignore Mission Planner (255) and radio (51)
+                if hasattr(msg, 'get_srcSystem'):
+                    if msg.get_srcSystem() not in (1, 0):
+                        continue
 
                 t = msg.get_type()
 
@@ -456,6 +485,22 @@ class DroneGUI:
         self.mav.arducopter_disarm()
         self.log("Disarm command sent", "info")
 
+    def force_arm(self):
+        if not self.connected:
+            self.log("Not connected!", "error")
+            return
+        self.log("Force arming — bypassing all checks...", "warn")
+        self.mav.mav.command_long_send(
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            1,      # arm
+            21196,  # force arm magic number bypasses all checks
+            0, 0, 0, 0, 0
+        )
+        self.log("Force arm sent!", "info")
+
     def takeoff(self):
         self._takeoff(2.0)
 
@@ -486,46 +531,51 @@ class DroneGUI:
         self.mav.set_mode("RTL")
         self.log("RTL command sent", "info")
 
-    def activate_landing(self):
+    def start_precision_landing(self):
         if not self.connected:
             self.log("Not connected!", "error")
             return
-        self.log("Activating precision landing...", "warn")
-        self.mav.mav.command_long_send(
-            self.mav.target_system,
-            self.mav.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_LAND,
-            0, 0, 0, 0, 0, 0, 0, 0
-        )
-        self.log("Landing command sent!", "info")
+        self.log("", "normal")
+        self.log("=" * 44, "info")
+        self.log("  PRECISION LANDING SEQUENCE STARTED", "info")
+        self.log("=" * 44, "info")
+        self.log("Step 1 — Sending CLARQ_LAND to Jetson...", "info")
+        self.send_statustext(CMD_START_LANDING)
+        self.log("Step 2 — Setting GUIDED mode...", "info")
+        self.mav.set_mode("GUIDED")
+        self.log("Jetson return_land.py now handles:", "dim")
+        self.log("  Phase 1 — navigate to home via ZED", "dim")
+        self.log("  Phase 2 — center on AprilTag", "dim")
+        self.log("  Phase 3 — land on rover", "dim")
+        self.log("Watch Jetson terminal for phase updates", "info")
+        self.log("=" * 44, "info")
 
-    def enable_prec_land(self):
+    def stop_precision_landing(self):
         if not self.connected:
             self.log("Not connected!", "error")
             return
-        self.log("Enabling precision landing...", "cmd")
-        self.mav.mav.param_set_send(
-            self.mav.target_system,
-            self.mav.target_component,
-            b'PLND_ENABLED',
-            1,
-            mavutil.mavlink.MAV_PARAM_TYPE_INT8
-        )
-        self.log("PLND_ENABLED = 1 sent", "info")
+        self.log("Stopping precision landing!", "warn")
+        self.send_statustext(CMD_STOP_APRILTAG)
+        self.mav.set_mode("LOITER")
+        self.log("LOITER mode set — landing stopped", "warn")
 
-    def disable_prec_land(self):
+    def send_statustext(self, text):
         if not self.connected:
             self.log("Not connected!", "error")
             return
-        self.log("Disabling precision landing...", "cmd")
-        self.mav.mav.param_set_send(
-            self.mav.target_system,
-            self.mav.target_component,
-            b'PLND_ENABLED',
-            0,
-            mavutil.mavlink.MAV_PARAM_TYPE_INT8
+        self.log(f"Sending to Jetson: {text}", "cmd")
+        self.mav.mav.statustext_send(
+            mavutil.mavlink.MAV_SEVERITY_INFO,
+            text.encode('utf-8')
         )
-        self.log("PLND_ENABLED = 0 sent", "info")
+        self.log(f"Sent: {text}", "info")
+
+    def ping_jetson(self):
+        self.send_statustext(CMD_PING)
+        self.log(
+            "Ping sent — watch for FC: CLARQ_PONG "
+            "if Jetson listener is running",
+            "info")
 
 
 # ── Run ───────────────────────────────────────────────────────

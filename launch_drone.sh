@@ -14,6 +14,8 @@
 #   Ctrl+B, 3  -- save_position.py
 #   Ctrl+B, 4  -- return_land.py
 #   Ctrl+B, 5  -- monitor terminal
+#   Ctrl+B, 6  -- MAVROS (Pixhawk USB bridge)
+#   Ctrl+B, 7  -- mavlink_trigger_listener.py
 #   Ctrl+B, d  -- detach (programs keep running)
 #   Ctrl+B, [  -- scroll mode (q to exit)
 #   tmux attach -t drone  -- reattach
@@ -108,6 +110,25 @@ tmux send-keys -t $SESSION:5 \
      echo '  ros2 topic echo /detections' && \
      echo ''" Enter
 
+# ── Window 6: MAVROS — bridges Pixhawk USB to ROS2 ------------
+# Required so return_land.py can receive GUI commands via
+# /mavros/statustext/recv and send velocity commands to Pixhawk
+tmux new-window -t $SESSION:6 -n "mavros"
+tmux send-keys -t $SESSION:6 \
+    "sleep 5 && $SRC && \
+     ros2 launch mavros apm.launch \
+     fcu_url:=/dev/ttyACM0:115200" Enter
+
+# ── Window 7: MAVLink trigger listener -------------------------
+# Listens for CLARQ_* commands from Windows GUI via MAVROS
+# When CLARQ_LAND received:
+#   1. Starts apriltag_ros node
+#   2. Starts return_land.py
+# Must start after MAVROS (window 6) is ready
+tmux new-window -t $SESSION:7 -n "trigger"
+tmux send-keys -t $SESSION:7 \
+    "sleep 8 && $SRC && cd \"$WS\" && python3 mavlink_trigger_listener.py" Enter
+
 tmux select-window -t $SESSION:0
 
 echo ""
@@ -125,6 +146,12 @@ echo "  Ctrl+B, 2  -- set_origin.py (starts in 12 sec) -- PRESS SPACE to save"
 echo "  Ctrl+B, 3  -- save_position.py -- run after scan loiters"
 echo "  Ctrl+B, 4  -- return_land.py  -- run when return mission starts"
 echo "  Ctrl+B, 5  -- monitor terminal"
+echo "  Ctrl+B, 6  -- MAVROS (Pixhawk USB — starts in 5 sec)"
+echo "  Ctrl+B, 7  -- MAVLink trigger listener (starts in 8 sec)"
+echo ""
+echo "  GUI command flow:"
+echo "    START PREC LAND → CLARQ_LAND → Pixhawk → MAVROS"
+echo "    → trigger listener → starts apriltag + return_land"
 echo ""
 echo "  Ctrl+B, d  -- detach session"
 echo "  tmux attach -t drone  -- reattach"
