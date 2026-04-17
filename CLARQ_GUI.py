@@ -1,23 +1,49 @@
 # CLARQ_GUI.py
 # Runs on Windows alongside Mission Planner
-# Sends MAVLink commands directly to Pixhawk via UDP from Mission Planner
-# pip install pymavlink
+# Telemetry:  Pixhawk → Mission Planner → UDP 14550 → GUI (recv)
+# Commands:   GUI → NRF24L01 via Arduino (primary, direct to Jetson)
+#             GUI → UDP 14552 → Mission Planner → Pixhawk (MAVLink fallback)
+#
+# pip install pymavlink pyserial
+#
+# Hardware: Arduino Nano + NRF24L01 plugged into Windows USB
+# Flash Arduino with clarq_rf_arduino.ino first
 
 import tkinter as tk
 from tkinter import scrolledtext
 from pymavlink import mavutil
 import threading
 import time
+import serial
+import serial.tools.list_ports
 
 # ── Config ────────────────────────────────────────────────────
-MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
+MAVLINK_RECV      = "udp:127.0.0.1:14550"
+MAVLINK_SEND_IP   = "127.0.0.1"
+MAVLINK_SEND_PORT = 14552
+ARDUINO_BAUD      = 115200
 
-# ── Jetson trigger commands via MAVLink STATUSTEXT ────────────
-# Route: GUI → Mission Planner → Pixhawk USB → MAVROS → Jetson
+# ── Command IDs ───────────────────────────────────────────────
+CMD_ID_PING       = 1
+CMD_ID_LAND       = 2
+CMD_ID_START_TAG  = 3
+CMD_ID_STOP_TAG   = 4
+CMD_ID_STOP_ALL   = 5
+CMD_ID_LAUNCH     = 6
+CMD_ID_LAUNCH_SIM = 7
+
 CMD_START_LANDING  = "CLARQ_LAND"
 CMD_START_APRILTAG = "CLARQ_START_TAG"
 CMD_STOP_APRILTAG  = "CLARQ_STOP_TAG"
 CMD_PING           = "CLARQ_PING"
+CMD_LAUNCH         = "CLARQ_LAUNCH"
+CMD_LAUNCH_SIM     = "CLARQ_LAUNCH_SIM"
+
+# ── Response IDs from Jetson via RF ───────────────────────────
+RESP_PONG         = 1
+RESP_LAUNCHED     = 6
+RESP_LAUNCHED_SIM = 7
+RESP_STOPPED      = 5
 
 # ── Colors ────────────────────────────────────────────────────
 BG     = "#0f0f16"
@@ -33,20 +59,23 @@ PURPLE = "#4a1a6b"
 
 class DroneGUI:
     def __init__(self, root):
-        self.root      = root
+        self.root         = root
         self.root.title("CLARQ Drone Control")
         self.root.geometry("1000x700")
         self.root.configure(bg=BG)
 
-        self.mav       = None
-        self.connected = False
-        self.telem_on  = False
+        self.mav          = None
+        self.mav_send     = None
+        self.connected    = False
+        self.telem_on     = False
+
+        self.arduino      = None   # pyserial connection to Arduino
+        self.rf_connected = False
+        self.rf_read_on   = False
 
         self.build_ui()
 
-    # ── UI ────────────────────────────────────────────────────
     def build_ui(self):
-
         title = tk.Frame(self.root, bg=PANEL, pady=12)
         title.pack(fill=tk.X)
 
@@ -57,18 +86,24 @@ class DroneGUI:
             bg=PANEL, fg=ACCENT
         ).pack(side=tk.LEFT, padx=20)
 
+        # RF status indicator top right
+        self.rf_label = tk.Label(
+            title,
+            text="RF ●",
+            font=("Consolas", 11),
+            bg=PANEL, fg=DIM)
+        self.rf_label.pack(side=tk.RIGHT, padx=10)
+
         self.conn_label = tk.Label(
             title,
             text="● DISCONNECTED",
             font=("Consolas", 12),
-            bg=PANEL, fg=WARN
-        )
+            bg=PANEL, fg=WARN)
         self.conn_label.pack(side=tk.RIGHT, padx=20)
 
         main = tk.Frame(self.root, bg=BG)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # ── Left scrollable panel ─────────────────────────────
         left_outer = tk.Frame(main, bg=PANEL, width=280)
         left_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         left_outer.pack_propagate(False)
@@ -77,12 +112,10 @@ class DroneGUI:
             left_outer, bg=PANEL, width=260,
             highlightthickness=0)
         left_scrollbar = tk.Scrollbar(
-            left_outer,
-            orient=tk.VERTICAL,
+            left_outer, orient=tk.VERTICAL,
             command=left_canvas.yview)
         left_canvas.configure(
             yscrollcommand=left_scrollbar.set)
-
         left_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -114,52 +147,70 @@ class DroneGUI:
             tk.Frame(parent, bg=DIM, height=1).pack(
                 fill=tk.X, padx=15, pady=(15, 0))
             tk.Label(
-                parent,
-                text=text,
+                parent, text=text,
                 font=("Consolas", 9),
                 bg=PANEL, fg=DIM
             ).pack(anchor=tk.W, padx=15, pady=(4, 6))
 
         def btn(text, color, cmd, state=tk.NORMAL):
             b = tk.Button(
-                parent,
-                text=text,
+                parent, text=text,
                 font=("Consolas", 12, "bold"),
                 bg=color, fg=TEXT,
                 activebackground=color,
-                relief=tk.FLAT,
-                cursor="hand2",
-                pady=10,
-                state=state,
-                command=cmd
-            )
+                relief=tk.FLAT, cursor="hand2",
+                pady=10, state=state, command=cmd)
             b.pack(fill=tk.X, padx=15, pady=3)
             return b
 
-        # ── Connection ────────────────────────────────────────
-        section("CONNECTION")
+        # ── RF / Arduino connection ───────────────────────────
+        section("RF RADIO (NRF24L01)")
+
+        port_frame = tk.Frame(parent, bg=PANEL)
+        port_frame.pack(fill=tk.X, padx=15, pady=4)
+        tk.Label(
+            port_frame, text="Port:",
+            font=("Consolas", 11),
+            bg=PANEL, fg=TEXT
+        ).pack(side=tk.LEFT)
+        self.rf_port_entry = tk.Entry(
+            port_frame, font=("Consolas", 11),
+            bg="#2a2a3a", fg=TEXT,
+            insertbackground=TEXT,
+            relief=tk.FLAT, width=10)
+        self.rf_port_entry.insert(0, "COM3")
+        self.rf_port_entry.pack(side=tk.LEFT, padx=5)
+
+        btn("SCAN PORTS",       BLUE, self.scan_ports)
+        btn("CONNECT RF",       GREEN, self.connect_rf)
+        btn("DISCONNECT RF",    RED,   self.disconnect_rf)
+
+        # ── Jetson ────────────────────────────────────────────
+        section("JETSON")
+        btn("LAUNCH JETSON",     GREEN, self.launch_jetson)
+        btn("LAUNCH JETSON SIM", BLUE,  self.launch_jetson_sim)
+        btn("KILL JETSON",       RED,   self.kill_jetson)
+
+        # ── MAVLink connection ────────────────────────────────
+        section("MAVLINK (TELEMETRY)")
 
         conn_frame = tk.Frame(parent, bg=PANEL)
         conn_frame.pack(fill=tk.X, padx=15, pady=4)
         tk.Label(
-            conn_frame,
-            text="Port:",
+            conn_frame, text="Port:",
             font=("Consolas", 11),
             bg=PANEL, fg=TEXT
         ).pack(side=tk.LEFT)
         self.conn_entry = tk.Entry(
-            conn_frame,
-            font=("Consolas", 11),
+            conn_frame, font=("Consolas", 11),
             bg="#2a2a3a", fg=TEXT,
             insertbackground=TEXT,
-            relief=tk.FLAT,
-            width=18
-        )
-        self.conn_entry.insert(0, MAVLINK_CONNECTION)
+            relief=tk.FLAT, width=18)
+        self.conn_entry.insert(0, MAVLINK_RECV)
         self.conn_entry.pack(side=tk.LEFT, padx=5)
 
-        btn("CONNECT",    BLUE, self.connect)
-        btn("DISCONNECT", RED,  self.disconnect)
+        btn("CONNECT MAV",    BLUE, self.connect)
+        btn("DISCONNECT MAV", RED,  self.disconnect)
 
         # ── Telemetry ─────────────────────────────────────────
         section("TELEMETRY")
@@ -168,7 +219,7 @@ class DroneGUI:
         telem.pack(fill=tk.X, padx=15, pady=5)
 
         self.telem = {}
-        fields = [
+        for label, default in [
             ("Mode",    "UNKNOWN"),
             ("Armed",   "NO"),
             ("Battery", "--V"),
@@ -177,24 +228,19 @@ class DroneGUI:
             ("Lon",     "--"),
             ("Heading", "--°"),
             ("Speed",   "--m/s"),
-        ]
-
-        for label, default in fields:
+        ]:
             row = tk.Frame(telem, bg="#12121e")
             row.pack(fill=tk.X, padx=10, pady=2)
             tk.Label(
-                row,
-                text=f"{label}:",
+                row, text=f"{label}:",
                 font=("Consolas", 11),
                 bg="#12121e", fg=DIM,
                 width=9, anchor=tk.W
             ).pack(side=tk.LEFT)
             lbl = tk.Label(
-                row,
-                text=default,
+                row, text=default,
                 font=("Consolas", 11, "bold"),
-                bg="#12121e", fg=ACCENT
-            )
+                bg="#12121e", fg=ACCENT)
             lbl.pack(side=tk.LEFT)
             self.telem[label] = lbl
 
@@ -212,10 +258,9 @@ class DroneGUI:
             ("ALTHOLD",   BLUE),
             ("POSHOLD",   BLUE),
         ]:
-            b = btn(
-                mode, color,
-                lambda m=mode: self.set_mode(m),
-                tk.DISABLED)
+            b = btn(mode, color,
+                    lambda m=mode: self.set_mode(m),
+                    tk.DISABLED)
             self.flight_btns.append(b)
 
         # ── Arm / Disarm ──────────────────────────────────────
@@ -232,73 +277,75 @@ class DroneGUI:
         section("COMMANDS")
 
         self.cmd_btns = []
-        commands = [
+        for text, color, cmd in [
             ("TAKEOFF 2m",       BLUE, self.takeoff),
             ("TAKEOFF 5m",       BLUE, self.takeoff_5),
             ("TAKEOFF 10m",      BLUE, self.takeoff_10),
             ("RETURN TO LAUNCH", WARN, self.rtl),
-        ]
-        for text, color, cmd in commands:
+        ]:
             b = btn(text, color, cmd, tk.DISABLED)
             self.cmd_btns.append(b)
 
         # ── Precision landing ─────────────────────────────────
         section("PRECISION LANDING")
 
+        self.jetson_status_lbl = tk.Label(
+            parent, text="Jetson: IDLE",
+            font=("Consolas", 11, "bold"),
+            bg=PANEL, fg=DIM)
+        self.jetson_status_lbl.pack(
+            anchor=tk.W, padx=15, pady=(4, 2))
+
+        self.jetson_phase_lbl = tk.Label(
+            parent, text="Phase: --",
+            font=("Consolas", 10),
+            bg=PANEL, fg=DIM)
+        self.jetson_phase_lbl.pack(
+            anchor=tk.W, padx=15, pady=(0, 6))
+
         self.prec_btns = []
-        prec_commands = [
+        for text, color, cmd in [
             ("START PREC LAND", GREEN, self.start_precision_landing),
             ("STOP PREC LAND",  RED,   self.stop_precision_landing),
             ("PING JETSON",     BLUE,  self.ping_jetson),
-        ]
-        for text, color, cmd in prec_commands:
+        ]:
             b = btn(text, color, cmd, tk.DISABLED)
             self.prec_btns.append(b)
 
         tk.Frame(parent, bg=PANEL, height=20).pack()
 
     def build_output(self, parent):
-
         header = tk.Frame(parent, bg=PANEL)
         header.pack(fill=tk.X, padx=10, pady=(10, 5))
 
         tk.Label(
-            header,
-            text="MAVLINK OUTPUT",
+            header, text="OUTPUT LOG",
             font=("Consolas", 12),
             bg=PANEL, fg=DIM
         ).pack(side=tk.LEFT)
 
         tk.Button(
-            header,
-            text="CLEAR",
+            header, text="CLEAR",
             font=("Consolas", 10),
             bg="#2a2a3a", fg=TEXT,
-            relief=tk.FLAT,
-            cursor="hand2",
+            relief=tk.FLAT, cursor="hand2",
             command=self.clear
         ).pack(side=tk.RIGHT, padx=5)
 
         tk.Button(
-            header,
-            text="SAVE LOG",
+            header, text="SAVE LOG",
             font=("Consolas", 10),
             bg="#2a2a3a", fg=TEXT,
-            relief=tk.FLAT,
-            cursor="hand2",
+            relief=tk.FLAT, cursor="hand2",
             command=self.save_log
         ).pack(side=tk.RIGHT, padx=5)
 
         self.output = scrolledtext.ScrolledText(
-            parent,
-            font=("Consolas", 11),
-            bg="#0a0a14",
-            fg=TEXT,
+            parent, font=("Consolas", 11),
+            bg="#0a0a14", fg=TEXT,
             insertbackground=TEXT,
-            relief=tk.FLAT,
-            wrap=tk.WORD,
-            state=tk.DISABLED
-        )
+            relief=tk.FLAT, wrap=tk.WORD,
+            state=tk.DISABLED)
         self.output.pack(
             fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
 
@@ -306,6 +353,7 @@ class DroneGUI:
         self.output.tag_config("warn",   foreground=WARN)
         self.output.tag_config("error",  foreground="#dc3838")
         self.output.tag_config("cmd",    foreground="#6496c8")
+        self.output.tag_config("rf",     foreground="#c850c8")
         self.output.tag_config("normal", foreground=TEXT)
         self.output.tag_config("dim",    foreground=DIM)
 
@@ -327,7 +375,7 @@ class DroneGUI:
 
     def save_log(self):
         content = self.output.get(1.0, tk.END)
-        fname   = f"mavlink_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        fname = f"clarq_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
         with open(fname, 'w') as f:
             f.write(content)
         self.log(f"Log saved to {fname}", "info")
@@ -338,6 +386,22 @@ class DroneGUI:
                 self.telem[key].config(text=value)
         self.root.after(0, _u)
 
+    def update_jetson_status(self, resp_id):
+        status_map = {
+            RESP_PONG:         ("ONLINE ✓",       ACCENT, "--"),
+            RESP_LAUNCHED:     ("LAUNCHED ✓",      ACCENT, "All systems starting"),
+            RESP_LAUNCHED_SIM: ("LAUNCHED SIM ✓",  ACCENT, "Sim stack starting"),
+            RESP_STOPPED:      ("STOPPED",          DIM,    "All processes stopped"),
+        }
+        if resp_id in status_map:
+            status, color, phase = status_map[resp_id]
+            def _update():
+                self.jetson_status_lbl.config(
+                    text=f"Jetson: {status}", fg=color)
+                self.jetson_phase_lbl.config(
+                    text=f"Phase: {phase}", fg=color)
+            self.root.after(0, _update)
+
     def enable_buttons(self):
         for b in (self.flight_btns +
                   self.cmd_btns +
@@ -347,36 +411,182 @@ class DroneGUI:
         self.disarm_btn.config(state=tk.NORMAL)
         self.force_arm_btn.config(state=tk.NORMAL)
 
-    # ── Connection ────────────────────────────────────────────
+    # ── RF / Arduino ──────────────────────────────────────────
+    def scan_ports(self):
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            self.log("No serial ports found", "warn")
+            return
+        self.log("Available ports:", "info")
+        for p in ports:
+            self.log(f"  {p.device} — {p.description}", "dim")
+
+    def connect_rf(self):
+        def _connect():
+            try:
+                port = self.rf_port_entry.get()
+                self.log(
+                    f"Connecting RF on {port}...", "rf")
+                self.arduino = serial.Serial(
+                    port, ARDUINO_BAUD, timeout=2)
+                time.sleep(2)   # Wait for Arduino reset
+
+                # Wait for ready message
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if self.arduino.in_waiting:
+                        line = self.arduino.readline()\
+                            .decode('utf-8', errors='ignore')\
+                            .strip()
+                        if line == "CLARQ_RF_READY":
+                            break
+                        self.log(f"Arduino: {line}", "dim")
+
+                self.rf_connected = True
+                self.log("RF connected! Arduino ready.", "rf")
+                self.root.after(0, lambda: self.rf_label.config(
+                    text="RF ●", fg=ACCENT))
+
+                # Start reading responses from Arduino
+                self.rf_read_on = True
+                threading.Thread(
+                    target=self._rf_read_loop,
+                    daemon=True).start()
+
+            except Exception as e:
+                self.log(f"RF connect failed: {e}", "error")
+
+        threading.Thread(target=_connect, daemon=True).start()
+
+    def disconnect_rf(self):
+        self.rf_connected = False
+        self.rf_read_on   = False
+        if self.arduino:
+            try:
+                self.arduino.close()
+            except Exception:
+                pass
+            self.arduino = None
+        self.log("RF disconnected", "warn")
+        self.root.after(0, lambda: self.rf_label.config(
+            text="RF ●", fg=DIM))
+
+    def _rf_read_loop(self):
+        """Read responses from Arduino (TX_OK, RX, errors)."""
+        while self.rf_read_on and self.rf_connected:
+            try:
+                if self.arduino and self.arduino.in_waiting:
+                    line = self.arduino.readline()\
+                        .decode('utf-8', errors='ignore')\
+                        .strip()
+                    if not line:
+                        continue
+
+                    if line.startswith("TX_OK:"):
+                        cmd_id = int(line.split(":")[1])
+                        self.log(
+                            f"RF TX OK — cmd {cmd_id} sent",
+                            "rf")
+                    elif line.startswith("TX_FAIL:"):
+                        cmd_id = int(line.split(":")[1])
+                        self.log(
+                            f"RF TX FAILED — cmd {cmd_id}",
+                            "error")
+                    elif line.startswith("RX:"):
+                        # Response received from Jetson via RF
+                        resp_id = int(line.split(":")[1])
+                        resp_names = {
+                            1: "CLARQ_PONG",
+                            5: "CLARQ_ALL_STOPPED",
+                            6: "CLARQ_LAUNCHED",
+                            7: "CLARQ_LAUNCHED_SIM",
+                        }
+                        name = resp_names.get(
+                            resp_id, f"RESP_{resp_id}")
+                        self.log(
+                            f"JETSON RF: {name}", "info")
+                        self.update_jetson_status(resp_id)
+                    else:
+                        self.log(
+                            f"Arduino: {line}", "dim")
+                else:
+                    time.sleep(0.02)
+            except Exception as e:
+                if self.rf_read_on:
+                    self.log(f"RF read error: {e}", "error")
+                break
+
+    def send_rf_cmd(self, cmd_id):
+        """Send command ID to Arduino over USB serial."""
+        if not self.rf_connected or not self.arduino:
+            return False
+        try:
+            msg = f"CMD:{cmd_id}\n".encode()
+            self.arduino.write(msg)
+            self.log(
+                f"RF → Arduino CMD:{cmd_id}", "rf")
+            return True
+        except Exception as e:
+            self.log(f"RF send error: {e}", "error")
+            return False
+
+    def send_jetson_cmd(self, cmd_id, text):
+        """
+        Send command to Jetson.
+        Primary:  RF via NRF24L01 → Arduino → Jetson
+        Fallback: MAVLink COMMAND_LONG (if MAVLink connected)
+        """
+        self.log(
+            f"Sending to Jetson: {text} (id={cmd_id})", "cmd")
+
+        # Primary — RF radio
+        rf_sent = False
+        if self.rf_connected:
+            rf_sent = self.send_rf_cmd(cmd_id)
+
+        if not rf_sent:
+            self.log(
+                "RF not available — trying MAVLink fallback",
+                "warn")
+
+        # Fallback — MAVLink COMMAND_LONG
+        if self.connected and self.mav_send:
+            try:
+                self.mav_send.mav.command_long_send(
+                    self.mav_send.target_system,
+                    self.mav_send.target_component,
+                    mavutil.mavlink.MAV_CMD_USER_1,
+                    0,
+                    float(cmd_id),
+                    0, 0, 0, 0, 0, 0)
+                self.log(
+                    f"MAVLink fallback: "
+                    f"COMMAND_LONG cmd={cmd_id}", "dim")
+            except Exception as e:
+                self.log(
+                    f"MAVLink fallback failed: {e}", "warn")
+
+    # ── MAVLink connection ────────────────────────────────────
     def connect(self):
         def _connect():
             try:
                 conn = self.conn_entry.get()
-                self.log(f"Connecting to {conn}...", "info")
+                self.log(
+                    f"Connecting MAVLink to {conn}...", "info")
                 self.mav = mavutil.mavlink_connection(conn)
                 self.log("Waiting for heartbeat...", "dim")
                 self.mav.wait_heartbeat(timeout=10)
-
-                # Always target the Pixhawk (system 1)
-                # not Mission Planner (system 255)
                 self.mav.target_system    = 1
                 self.mav.target_component = 1
 
-                self.connected = True
-                self.log(
-                    f"Connected! Targeting system 1 (Pixhawk)",
-                    "info")
+                self.mav_send = mavutil.mavlink_connection(
+                    f"udpout:{MAVLINK_SEND_IP}:{MAVLINK_SEND_PORT}",
+                    source_system=254)
+                self.mav_send.target_system    = 1
+                self.mav_send.target_component = 1
 
-                # Request all data streams from Pixhawk at 4 Hz
-                # This is required for real hardware —
-                # SITL sends data automatically but real Pixhawk needs asking
-                self.mav.mav.request_data_stream_send(
-                    1, 1,
-                    mavutil.mavlink.MAV_DATA_STREAM_ALL,
-                    4,   # 4 Hz
-                    1    # start streaming
-                )
-                self.log("Data streams requested at 4Hz", "dim")
+                self.connected = True
+                self.log("MAVLink connected!", "info")
 
                 self.root.after(0, lambda: self.conn_label.config(
                     text="● CONNECTED", fg=ACCENT))
@@ -384,14 +594,15 @@ class DroneGUI:
                 self.start_telemetry()
 
             except Exception as e:
-                self.log(f"Connection failed: {e}", "error")
+                self.log(
+                    f"MAVLink connection failed: {e}", "error")
 
         threading.Thread(target=_connect, daemon=True).start()
 
     def disconnect(self):
         self.connected = False
         self.telem_on  = False
-        self.log("Disconnected", "warn")
+        self.log("MAVLink disconnected", "warn")
         self.root.after(0, lambda: self.conn_label.config(
             text="● DISCONNECTED", fg=WARN))
 
@@ -406,27 +617,30 @@ class DroneGUI:
             try:
                 msg = self.mav.recv_match(
                     type=[
-                        'HEARTBEAT',
-                        'SYS_STATUS',
+                        'HEARTBEAT', 'SYS_STATUS',
                         'GLOBAL_POSITION_INT',
-                        'VFR_HUD',
-                        'STATUSTEXT'
+                        'VFR_HUD', 'STATUSTEXT'
                     ],
-                    blocking=True,
-                    timeout=1
-                )
+                    blocking=True, timeout=1)
                 if msg is None:
                     continue
 
-                # Only process messages from Pixhawk (system 1)
-                # ignore Mission Planner (255) and radio (51)
-                if hasattr(msg, 'get_srcSystem'):
-                    if msg.get_srcSystem() not in (1, 0):
-                        continue
-
                 t = msg.get_type()
 
+                if t == 'STATUSTEXT':
+                    text = msg.text.strip()
+                    if text.startswith('CLARQ'):
+                        self.log(f"JETSON MAV: {text}", "info")
+                    else:
+                        self.log(f"FC: {text}", "dim")
+                    continue
+
                 if t == 'HEARTBEAT':
+                    src = (msg.get_srcSystem()
+                           if hasattr(msg, 'get_srcSystem')
+                           else 1)
+                    if src != 1:
+                        continue
                     mode  = mavutil.mode_string_v10(msg)
                     armed = bool(
                         msg.base_mode &
@@ -453,129 +667,108 @@ class DroneGUI:
                     self.update_telem(
                         'Speed', f'{msg.groundspeed:.1f}m/s')
 
-                elif t == 'STATUSTEXT':
-                    self.log(
-                        f"FC: {msg.text.strip()}", "dim")
-
             except Exception:
                 break
 
-    # ── MAVLink commands ──────────────────────────────────────
+    # ── MAVLink flight commands ───────────────────────────────
     def set_mode(self, mode):
         if not self.connected:
-            self.log("Not connected!", "error")
+            self.log("MAVLink not connected!", "error")
             return
         self.log(f"Setting mode: {mode}", "cmd")
-        self.mav.set_mode(mode)
+        mode_map = {
+            "STABILIZE": 0, "ACRO": 1, "ALTHOLD": 2,
+            "AUTO": 3,      "GUIDED": 4, "LOITER": 5,
+            "RTL": 6,       "CIRCLE": 7, "LAND": 9,
+            "POSHOLD": 16,
+        }
+        if mode in mode_map:
+            self.mav_send.mav.set_mode_send(
+                self.mav_send.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_map[mode])
+        else:
+            self.mav_send.set_mode(mode)
         self.log(f"Mode {mode} sent", "info")
 
     def arm(self):
         if not self.connected:
-            self.log("Not connected!", "error")
+            self.log("MAVLink not connected!", "error")
             return
         self.log("Arming...", "warn")
-        self.mav.arducopter_arm()
+        self.mav_send.arducopter_arm()
         self.log("Arm command sent", "info")
 
     def disarm(self):
         if not self.connected:
-            self.log("Not connected!", "error")
+            self.log("MAVLink not connected!", "error")
             return
         self.log("Disarming...", "warn")
-        self.mav.arducopter_disarm()
+        self.mav_send.arducopter_disarm()
         self.log("Disarm command sent", "info")
 
     def force_arm(self):
         if not self.connected:
-            self.log("Not connected!", "error")
+            self.log("MAVLink not connected!", "error")
             return
-        self.log("Force arming — bypassing all checks...", "warn")
-        self.mav.mav.command_long_send(
-            self.mav.target_system,
-            self.mav.target_component,
+        self.log("Force arming...", "warn")
+        self.mav_send.mav.command_long_send(
+            self.mav_send.target_system,
+            self.mav_send.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,
-            1,      # arm
-            21196,  # force arm magic number bypasses all checks
-            0, 0, 0, 0, 0
-        )
+            0, 1, 21196, 0, 0, 0, 0, 0)
         self.log("Force arm sent!", "info")
 
-    def takeoff(self):
-        self._takeoff(2.0)
-
-    def takeoff_5(self):
-        self._takeoff(5.0)
-
-    def takeoff_10(self):
-        self._takeoff(10.0)
+    def takeoff(self):    self._takeoff(2.0)
+    def takeoff_5(self):  self._takeoff(5.0)
+    def takeoff_10(self): self._takeoff(10.0)
 
     def _takeoff(self, alt):
         if not self.connected:
-            self.log("Not connected!", "error")
+            self.log("MAVLink not connected!", "error")
             return
         self.log(f"Sending takeoff to {alt}m...", "cmd")
-        self.mav.mav.command_long_send(
-            self.mav.target_system,
-            self.mav.target_component,
+        self.mav_send.mav.command_long_send(
+            self.mav_send.target_system,
+            self.mav_send.target_component,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, alt
-        )
-        self.log(f"Takeoff {alt}m command sent", "info")
+            0, 0, 0, 0, 0, 0, 0, alt)
+        self.log(f"Takeoff {alt}m sent", "info")
 
     def rtl(self):
         if not self.connected:
-            self.log("Not connected!", "error")
+            self.log("MAVLink not connected!", "error")
             return
         self.log("Return to launch...", "warn")
-        self.mav.set_mode("RTL")
-        self.log("RTL command sent", "info")
+        self.set_mode("RTL")
+
+    # ── Jetson commands (RF primary, MAVLink fallback) ────────
+    def ping_jetson(self):
+        self.send_jetson_cmd(CMD_ID_PING, CMD_PING)
+
+    def launch_jetson(self):
+        self.send_jetson_cmd(CMD_ID_LAUNCH, CMD_LAUNCH)
+
+    def launch_jetson_sim(self):
+        self.send_jetson_cmd(CMD_ID_LAUNCH_SIM, CMD_LAUNCH_SIM)
+
+    def kill_jetson(self):
+        self.send_jetson_cmd(CMD_ID_STOP_ALL, "CLARQ_STOP_ALL")
 
     def start_precision_landing(self):
-        if not self.connected:
-            self.log("Not connected!", "error")
-            return
-        self.log("", "normal")
         self.log("=" * 44, "info")
-        self.log("  PRECISION LANDING SEQUENCE STARTED", "info")
+        self.log("  PRECISION LANDING STARTED", "info")
         self.log("=" * 44, "info")
-        self.log("Step 1 — Sending CLARQ_LAND to Jetson...", "info")
-        self.send_statustext(CMD_START_LANDING)
-        self.log("Step 2 — Setting GUIDED mode...", "info")
-        self.mav.set_mode("GUIDED")
-        self.log("Jetson return_land.py now handles:", "dim")
-        self.log("  Phase 1 — navigate to home via ZED", "dim")
-        self.log("  Phase 2 — center on AprilTag", "dim")
-        self.log("  Phase 3 — land on rover", "dim")
-        self.log("Watch Jetson terminal for phase updates", "info")
-        self.log("=" * 44, "info")
+        self.send_jetson_cmd(CMD_ID_LAND, CMD_START_LANDING)
+        if self.connected:
+            self.set_mode("GUIDED")
+        self.log("Jetson now handles phases 1-3", "dim")
 
     def stop_precision_landing(self):
-        if not self.connected:
-            self.log("Not connected!", "error")
-            return
         self.log("Stopping precision landing!", "warn")
-        self.send_statustext(CMD_STOP_APRILTAG)
-        self.mav.set_mode("LOITER")
-        self.log("LOITER mode set — landing stopped", "warn")
-
-    def send_statustext(self, text):
-        if not self.connected:
-            self.log("Not connected!", "error")
-            return
-        self.log(f"Sending to Jetson: {text}", "cmd")
-        self.mav.mav.statustext_send(
-            mavutil.mavlink.MAV_SEVERITY_INFO,
-            text.encode('utf-8')
-        )
-        self.log(f"Sent: {text}", "info")
-
-    def ping_jetson(self):
-        self.send_statustext(CMD_PING)
-        self.log(
-            "Ping sent — watch for FC: CLARQ_PONG "
-            "if Jetson listener is running",
-            "info")
+        self.send_jetson_cmd(CMD_ID_STOP_TAG, CMD_STOP_APRILTAG)
+        if self.connected:
+            self.set_mode("LOITER")
 
 
 # ── Run ───────────────────────────────────────────────────────
