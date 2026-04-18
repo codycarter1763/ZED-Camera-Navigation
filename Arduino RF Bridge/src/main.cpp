@@ -1,8 +1,20 @@
 // clarq_rf_arduino.ino
 // Arduino Nano — CLARQ RF Bridge
 // Reads command IDs from USB serial (from CLARQ_GUI.py)
-// Transmits over NRF24L01 to Jetson on drone
-
+// Transmits over NRF24L01 to Jetson
+//
+// Wiring (Arduino Nano):
+//   NRF24L01   Arduino Nano
+//   ─────────  ────────────
+//   VCC     →  3.3V
+//   GND     →  GND
+//   CE      →  D9
+//   CSN     →  D10
+//   SCK     →  D13
+//   MOSI    →  D11
+//   MISO    →  D12
+//
+// Install library: RF24 by TMRh20 (Arduino Library Manager)
 
 #include <SPI.h>
 #include <RF24.h>
@@ -27,6 +39,10 @@ const byte READ_PIPE[]  = "JTSN0";   // Jetson → GUI (ACK/PONG)
 #define CMD_STOP_ALL    5
 #define CMD_LAUNCH      6
 #define CMD_LAUNCH_SIM  7
+#define CMD_SET_HOME    8
+#define CMD_START_SCAN  9
+#define CMD_SAVE_END    10
+#define CMD_GO_HOME     11
 
 // ── Packet structure ──────────────────────────────────────────
 // Keep it simple — just 2 bytes
@@ -88,7 +104,7 @@ void loop() {
 
     int cmd_id = line.substring(4).toInt();
 
-    if (cmd_id < 1 || cmd_id > 7) {
+    if (cmd_id < 1 || cmd_id > 11) {
       Serial.println("ERR:INVALID_CMD");
       return;
     }
