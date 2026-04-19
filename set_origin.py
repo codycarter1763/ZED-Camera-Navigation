@@ -8,32 +8,42 @@
 # ZED topic used:
 #   /zed/zed_node/pose  (geometry_msgs/PoseStamped)
 #
-# Usage:   python3 "set_origin.py"
-# Controls: SPACE = save origin    Q = quit
-# Output:   ~/ZED Navigation/origin_T0.json
+# Trigger methods (any of these saves the origin):
+#   1. Write trigger file: .set_home_trigger  (from clarq_rf_listener)
+#   2. Press SPACE in terminal (stdin)
+#   3. Press Q or Ctrl+C to quit
+#
+# Usage:   python3 set_origin.py
+# Output:  origin_T0.json  (same directory as this script)
 # ─────────────────────────────────────────────────────────────
 
-import json, os, sys, threading, time
-import pygame
+import json
+import os
+import sys
+import threading
+import time
+import select
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-ORIGIN_FILE = os.path.join(SCRIPT_DIR, "origin_T0.json")
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+ORIGIN_FILE   = os.path.join(SCRIPT_DIR, "origin_T0.json")
+TRIGGER_FILE  = os.path.join(SCRIPT_DIR, ".set_home_trigger")
 
-# ── ZED topic — matches zed_wrapper default namespace ─────────
+# ── ZED topic ─────────────────────────────────────────────────
 ZED_POSE_TOPIC = '/zed/zed_node/pose'
 
 # ── Shared state ──────────────────────────────────────────────
 class State:
     def __init__(self):
-        self.lock        = threading.Lock()
-        self.pos         = [0.0, 0.0, 0.0]
-        self.pose_ok     = False
-        self.origin_set  = False
-        self.status_msg  = "Waiting for ZED pose..."
-        self.pose_count  = 0
+        self.lock       = threading.Lock()
+        self.pos        = [0.0, 0.0, 0.0]
+        self.pose_ok    = False
+        self.origin_set = False
+        self.pose_count = 0
+
 S = State()
 
 # ── ROS2 node ─────────────────────────────────────────────────
@@ -62,77 +72,71 @@ def _ros_spin():
 threading.Thread(target=_ros_spin, daemon=True).start()
 time.sleep(1.0)
 
+# ── Save function ─────────────────────────────────────────────
 def save_origin():
     with S.lock:
         if not S.pose_ok:
-            S.status_msg = "ERROR: No ZED pose — is zed_apriltag.launch.py running?"
-            return
+            print("[set_origin] ERROR: No ZED pose received yet!")
+            return False
         data = {"x": S.pos[0], "y": S.pos[1], "z": S.pos[2]}
-        with open(ORIGIN_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        S.origin_set = True
-        S.status_msg = (f"SAVED  X:{S.pos[0]:.3f} "
-                        f"Y:{S.pos[1]:.3f}  Z:{S.pos[2]:.3f}")
-        print(f"[set_origin] Origin saved → {ORIGIN_FILE}")
-        print(f"[set_origin] Values: {data}")
 
-# ── Pygame HUD ────────────────────────────────────────────────
-pygame.init()
-W, H   = 460, 320
-screen = pygame.display.set_mode((W, H))
-pygame.display.set_caption("Program 1 — Set Origin  |  SPACE=save  Q=quit")
-FSM = pygame.font.SysFont("consolas", 13)
-FMD = pygame.font.SysFont("consolas", 15, bold=True)
-FLG = pygame.font.SysFont("consolas", 20, bold=True)
-clk = pygame.time.Clock()
-BG   = ( 15,  15,  22);  GR   = ( 35,  35,  50)
-C_OK = ( 30, 200, 130);  C_WR = (220, 100,  60)
-C_TX = (210, 210, 220);  C_DM = (100, 100, 120)
-
-running = True
-while running:
-    for ev in pygame.event.get():
-        if ev.type == pygame.QUIT: running = False
-        if ev.type == pygame.KEYDOWN:
-            if ev.key == pygame.K_q:       running = False
-            elif ev.key == pygame.K_SPACE: save_origin()
+    with open(ORIGIN_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
     with S.lock:
-        pos, ok, orig = S.pos.copy(), S.pose_ok, S.origin_set
-        status, cnt   = S.status_msg, S.pose_count
+        S.origin_set = True
 
-    screen.fill(BG)
-    def row(t, y, f=FSM, c=C_TX): screen.blit(f.render(t, True, c), (15, y))
+    print(f"[set_origin] ✓ Origin saved → {ORIGIN_FILE}")
+    print(f"[set_origin]   X: {data['x']:+.4f}")
+    print(f"[set_origin]   Y: {data['y']:+.4f}")
+    print(f"[set_origin]   Z: {data['z']:+.4f}")
+    return True
 
-    row("SET ORIGIN — PROGRAM 1",         12, FLG, C_TX)
-    pygame.draw.line(screen, GR, (15, 40), (W-15, 40), 1)
+# ── Clean up old trigger file on start ────────────────────────
+if os.path.exists(TRIGGER_FILE):
+    os.remove(TRIGGER_FILE)
 
-    row("ZED POSE TOPIC",                 52, FSM, C_DM)
-    row(ZED_POSE_TOPIC,                   67, FSM, C_DM)
-    row("LIVE ✓" if ok else "NO SIGNAL",  82, FMD, C_OK if ok else C_WR)
-    row(f"Msgs received: {cnt}",          98, FSM, C_DM)
+# ── Main loop ─────────────────────────────────────────────────
+print("=" * 44)
+print("  SET ORIGIN — waiting for trigger")
+print(f"  Pose topic: {ZED_POSE_TOPIC}")
+print(f"  Output:     {ORIGIN_FILE}")
+print("  Trigger:    GUI SET HOME button")
+print("  Manual:     press SPACE + Enter")
+print("=" * 44)
 
-    pygame.draw.line(screen, GR, (15, 116), (W-15, 116), 1)
-    row("CURRENT POSITION (m)",          126, FSM, C_DM)
-    row(f"X {pos[0]:+.4f}  Y {pos[1]:+.4f}  Z {pos[2]:+.4f}",
-                                         141, FSM, C_OK if ok else C_WR)
+try:
+    while True:
+        with S.lock:
+            ok    = S.pose_ok
+            count = S.pose_count
+            pos   = S.pos.copy()
 
-    pygame.draw.line(screen, GR, (15, 162), (W-15, 162), 1)
-    row("ORIGIN FILE",                   172, FSM, C_DM)
-    row("SAVED ✓" if orig else "Not saved yet",
-                                         187, FMD, C_OK if orig else C_DM)
-    row(ORIGIN_FILE,                     204, FSM, C_DM)
+        # Print live pose every 2 seconds
+        if ok and count % 30 == 0:
+            print(f"[set_origin] Live pose — "
+                  f"X:{pos[0]:+.4f} Y:{pos[1]:+.4f} Z:{pos[2]:+.4f}")
 
-    pygame.draw.line(screen, GR, (15, 224), (W-15, 224), 1)
-    row(status,                          236, FSM, C_OK if orig else C_WR)
+        # Method 1 — check trigger file
+        if os.path.exists(TRIGGER_FILE):
+            print("[set_origin] Trigger file detected — saving origin...")
+            try:
+                os.remove(TRIGGER_FILE)
+            except Exception:
+                pass
+            save_origin()
 
-    pygame.draw.line(screen, GR, (15, 258), (W-15, 258), 1)
-    row("Hover drone over landing pad,", 270, FSM, C_DM)
-    row("then SPACE to lock in origin.", 286, FSM, C_DM)
-    row("[SPACE] Save    [Q] Quit",      302, FSM, C_DM)
+        # Method 2 — check stdin for SPACE keypress (non-blocking)
+        if select.select([sys.stdin], [], [], 0)[0]:
+            key = sys.stdin.read(1)
+            if key == ' ':
+                print("[set_origin] SPACE pressed — saving origin...")
+                save_origin()
+            elif key in ('q', 'Q'):
+                print("[set_origin] Quit")
+                break
 
-    pygame.display.flip()
-    clk.tick(30)
+        time.sleep(0.1)
 
-pygame.quit()
-sys.exit()
+except KeyboardInterrupt:
+    print("\n[set_origin] Stopped")

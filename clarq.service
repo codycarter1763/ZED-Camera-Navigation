@@ -1,0 +1,26 @@
+[Unit]
+Description=CLARQ Drone Launcher + nRF Command Listener
+After=network.target
+
+[Service]
+User=clarq
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/clarq
+
+# Step 1: Run launch_drone.sh (starts tmux session with ZED, AprilTag, etc.)
+ExecStartPre=/bin/bash "/home/clarq/ZED Navigation/launch_drone.sh"
+
+# Step 2: Give tmux session time to fully start before listener begins
+ExecStartPre=/bin/sleep 10
+
+# Step 3: Start the nRF command listener
+ExecStart=/usr/bin/python3 "/home/clarq/ZED Navigation/ZED-Camera-Navigation/clarq_rf_listener.py"
+
+WorkingDirectory=/home/clarq/ZED Navigation/ZED-Camera-Navigation
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
