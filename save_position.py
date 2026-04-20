@@ -9,6 +9,7 @@
 #
 # Usage:   python3 "save_position.py"
 # Controls: SPACE = save    Q = quit
+#           GUI "SAVE END POINT" button also triggers save
 # Output:   ~/ZED Navigation/scan_end_pos.json
 # ─────────────────────────────────────────────────────────────
 
@@ -20,6 +21,7 @@ from geometry_msgs.msg import PoseStamped
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 SCAN_END_FILE = os.path.join(SCRIPT_DIR, "scan_end_pos.json")
+TRIGGER_FILE  = os.path.join(SCRIPT_DIR, ".save_end_trigger")
 ZED_POSE_TOPIC = '/zed/zed_node/pose'
 
 class State:
@@ -68,6 +70,36 @@ def save_position():
         S.status = (f"SAVED  X:{S.pos[0]:.3f} "
                     f"Y:{S.pos[1]:.3f}  Z:{S.pos[2]:.3f}")
         print(f"[save_position] Saved → {SCAN_END_FILE}")
+        print(f"[save_position] "
+              f"X:{data['x']:.3f} "
+              f"Y:{data['y']:.3f} "
+              f"Z:{data['z']:.3f}")
+
+# ── RF trigger watcher ────────────────────────────────────────
+# Watches for .save_end_trigger written by clarq_rf_listener.py
+# when GUI SAVE END POINT button is pressed
+def _watch_trigger():
+    last_trigger_time = 0.0
+    while True:
+        time.sleep(0.05)
+        if not os.path.exists(TRIGGER_FILE):
+            continue
+        try:
+            with open(TRIGGER_FILE) as f:
+                trigger_time = float(f.read().strip())
+        except Exception:
+            continue
+        if trigger_time <= last_trigger_time:
+            continue
+        last_trigger_time = trigger_time
+        print("[save_position] RF trigger received — saving...")
+        save_position()
+        try:
+            os.remove(TRIGGER_FILE)
+        except Exception:
+            pass
+
+threading.Thread(target=_watch_trigger, daemon=True).start()
 
 # ── Pygame HUD ────────────────────────────────────────────────
 pygame.init()
@@ -108,14 +140,15 @@ while running:
                                          129, FSM, C_OK if ok else C_WR)
     pygame.draw.line(screen, GR, (15, 150), (W-15, 150), 1)
     row("SCAN END POSITION",             160, FSM, C_DM)
-    row("SAVED ✓" if saved else "Not saved yet",
+    row("SAVED ✓" if saved else "Not saved yet — waiting for GUI or SPACE",
                                          175, FMD, C_OK if saved else C_DM)
     pygame.draw.line(screen, GR, (15, 200), (W-15, 200), 1)
     row(status,                          212, FSM, C_OK if saved else C_WR)
     pygame.draw.line(screen, GR, (15, 235), (W-15, 235), 1)
     row("Run after scan mission reaches loiter WP.", 247, FSM, C_DM)
-    row("[SPACE] Save position    [Q] Quit",         263, FSM, C_DM)
-    row("Output: " + SCAN_END_FILE,                  279, FSM, C_DM)
+    row("[SPACE] Save    [Q] Quit    GUI button also works",
+                                         263, FSM, C_DM)
+    row("Output: " + SCAN_END_FILE,      279, FSM, C_DM)
 
     pygame.display.flip()
     clk.tick(30)

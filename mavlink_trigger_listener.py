@@ -48,8 +48,6 @@ from mavros_msgs.msg import NamedValueInt
 # ── Config ────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE   = SCRIPT_DIR
-FCU_URL     = '/dev/ttyACM0'   # Pixhawk USB — for direct MAVLink listener
-FCU_BAUD    = 115200
 TAGS_CONFIG = os.path.expanduser(
     '~/ZED Navigation/ZED-Camera-Navigation/tags_config.yaml')
 
@@ -104,108 +102,17 @@ class TriggerListener(Node):
             '/mavros/statustext/send',
             10)
 
-        # ── Channel 0: Direct pymavlink on serial port ────────
-        # Catches COMMAND_LONG MAV_CMD_USER_1 and NAMED_VALUE_INT
-        # directly from Pixhawk USB — does not depend on MAVROS
-        self._fcu_mav = None
-        threading.Thread(
-            target=self._pymavlink_listener,
-            daemon=True).start()
-
         self.get_logger().info('=' * 44)
         self.get_logger().info('  MAVLink Trigger Listener started')
         self.get_logger().info('=' * 44)
         self.get_logger().info(
-            'Channel 0: pymavlink direct on ' + FCU_URL)
+            'Channel 1: /mavros/named_value/int (primary)')
         self.get_logger().info(
-            'Channel 1: /mavros/named_value/int (MAVROS)')
-        self.get_logger().info(
-            'Channel 2: /mavros/statustext/recv (MAVROS)')
+            'Channel 2: /mavros/statustext/recv (fallback)')
         self.get_logger().info(
             'Workspace: ' + WORKSPACE)
         self.get_logger().info(
             'Waiting for GUI commands...')
-
-    # ── Channel 0: Direct pymavlink listener ─────────────────
-    def _pymavlink_listener(self):
-        """
-        Direct MAVLink connection to Pixhawk on USB serial.
-        Catches COMMAND_LONG MAV_CMD_USER_1 sent from GUI.
-        Runs in a background thread independently of MAVROS.
-        """
-        import time as _time
-        while True:
-            try:
-                self.get_logger().info(
-                    f'Connecting pymavlink on {FCU_URL}:{FCU_BAUD}')
-                self._fcu_mav = mavutil.mavlink_connection(
-                    FCU_URL, baud=FCU_BAUD)
-                self._fcu_mav.wait_heartbeat(timeout=10)
-                self.get_logger().info(
-                    'pymavlink connected to Pixhawk!')
-
-                while True:
-                    msg = self._fcu_mav.recv_match(
-                        type=['COMMAND_LONG', 'NAMED_VALUE_INT'],
-                        blocking=True,
-                        timeout=2)
-                    if msg is None:
-                        continue
-
-                    t = msg.get_type()
-
-                    if t == 'COMMAND_LONG':
-                        # MAV_CMD_USER_1 = 31010
-                        if msg.command == 31010:
-                            cmd_id = int(msg.param1)
-                            self.get_logger().info(
-                                f'COMMAND_LONG MAV_CMD_USER_1 '
-                                f'cmd_id={cmd_id}')
-                            self._dispatch_cmd_id(cmd_id)
-
-                    elif t == 'NAMED_VALUE_INT':
-                        name = msg.name.decode(
-                            'utf-8', errors='ignore'
-                        ).strip().rstrip('\x00')
-                        if name == 'CLARQ':
-                            cmd_id = msg.value
-                            self.get_logger().info(
-                                f'pymavlink NAMED_VALUE_INT '
-                                f'CLARQ={cmd_id}')
-                            self._dispatch_cmd_id(cmd_id)
-
-            except Exception as e:
-                self.get_logger().warn(
-                    f'pymavlink error: {e} — retrying in 5s')
-                _time.sleep(5)
-
-    def _dispatch_cmd_id(self, cmd_id):
-        """Dispatch a command ID to the correct handler."""
-        if cmd_id == CMD_ID_PING:
-            self._handle_ping()
-        elif cmd_id == CMD_ID_LAND:
-            threading.Thread(
-                target=self._handle_land,
-                daemon=True).start()
-        elif cmd_id == CMD_ID_START_TAG:
-            threading.Thread(
-                target=self._start_apriltag,
-                daemon=True).start()
-        elif cmd_id == CMD_ID_STOP_TAG:
-            self._stop_apriltag()
-        elif cmd_id == CMD_ID_STOP_ALL:
-            self._stop_all()
-        elif cmd_id == CMD_ID_LAUNCH:
-            threading.Thread(
-                target=self._launch_drone,
-                daemon=True).start()
-        elif cmd_id == CMD_ID_LAUNCH_SIM:
-            threading.Thread(
-                target=lambda: self._launch_drone(sim=True),
-                daemon=True).start()
-        else:
-            self.get_logger().warn(
-                f'Unknown command ID: {cmd_id}')
 
     # ── Channel 1: NAMED_VALUE_INT callback ───────────────────
     def _named_value_cb(self, msg):

@@ -60,9 +60,9 @@ else
     tmux send-keys -t $SESSION:1 \
         "sleep 5 && $SRC && ros2 run apriltag_ros apriltag_node --ros-args \
 -r image_rect:=/zed/zed_node/rgb/color/rect/image \
--r camera_info:=/zed/zed_node/rgb/color/rect/camera_info \
+-r camera_info:=/zed/zed_node/left/color/rect/camera_info \
 -r detections:=/detections \
---params-file $HOME/tags_config.yaml" Enter
+--params-file '$HOME/ZED Navigation/ZED-Camera-Navigation/tags_config.yaml'" Enter
 fi
 
 # ── Window 2: Program 1 -- set_origin -------------------------
