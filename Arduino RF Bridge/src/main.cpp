@@ -1,149 +1,143 @@
-// clarq_rf_arduino.ino
-// Arduino Nano — CLARQ RF Bridge
-// Reads command IDs from USB serial (from CLARQ_GUI.py)
-// Transmits over NRF24L01 to Jetson
-//
-// Wiring (Arduino Nano):
-//   NRF24L01   Arduino Nano
-//   ─────────  ────────────
-//   VCC     →  3.3V
-//   GND     →  GND
-//   CE      →  D9
-//   CSN     →  D10
-//   SCK     →  D13
-//   MOSI    →  D11
-//   MISO    →  D12
-//
-// Install library: RF24 by TMRh20 (Arduino Library Manager)
+/*
+ * clarq_rf_arduino.ino - CLARQ RF Bridge (Arduino Nano)
+ * CLEAN VERSION - Minimal debug output
+ */
 
 #include <SPI.h>
 #include <RF24.h>
 
-// ── NRF24L01 pins ─────────────────────────────────────────────
-#define CE_PIN   9
-#define CSN_PIN  10
+// ── NRF24L01 Config ──────────────────────────────────────────
+#define CE_PIN  9
+#define CSN_PIN 10
 
 RF24 radio(CE_PIN, CSN_PIN);
 
-// ── RF channel and pipe address ───────────────────────────────
-// Must match Jetson side exactly
-const byte RF_CHANNEL   = 100;
-const byte WRITE_PIPE[] = "CLARQ";   // GUI → Jetson
-const byte READ_PIPE[]  = "JTSN0";   // Jetson → GUI (ACK/PONG)
+// Must match clarq_rf_listener.py exactly
+const uint8_t  RF_CHANNEL = 100;
+const uint64_t WRITE_PIPE = 0x5152414C43LL;  // "CLARQ" in hex
+const uint64_t READ_PIPE  = 0x304E53544ALL;  // "JTSN0" in hex
 
-// ── Command IDs — must match CLARQ_GUI.py ─────────────────────
-#define CMD_PING        1
-#define CMD_LAND        2
-#define CMD_START_TAG   3
-#define CMD_STOP_TAG    4
-#define CMD_STOP_ALL    5
-#define CMD_LAUNCH      6
-#define CMD_LAUNCH_SIM  7
-#define CMD_SET_HOME    8
-#define CMD_START_SCAN  9
-#define CMD_SAVE_END    10
-#define CMD_GO_HOME     11
+// ── Command IDs ──────────────────────────────────────────────
+#define CMD_ID_PING            1
+#define CMD_ID_LAND            2
+#define CMD_ID_START_TAG       3
+#define CMD_ID_STOP_TAG        4
+#define CMD_ID_STOP_ALL        5
+#define CMD_ID_LAUNCH          6
+#define CMD_ID_LAUNCH_SIM      7
+#define CMD_ID_SET_HOME        8
+#define CMD_ID_START_SCAN      9
+#define CMD_ID_SAVE_END        10
+#define CMD_ID_GO_HOME         11
+#define CMD_ID_START_3D_FUSION 12
+#define CMD_ID_STOP_3D_FUSION  13
+#define CMD_ID_START_PHOTO     14
+#define CMD_ID_START_VIDEO     15
+#define CMD_ID_STOP_CAPTURE    16
 
-// ── Packet structure ──────────────────────────────────────────
-// Keep it simple — just 2 bytes
-// byte 0: command ID
-// byte 1: checksum (XOR of byte 0 with 0xAA)
-struct ClarqPacket {
-  uint8_t cmd_id;
-  uint8_t checksum;
-};
-
-// ── LED feedback ──────────────────────────────────────────────
-#define LED_PIN LED_BUILTIN
-
-void blink(int times) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(80);
-    digitalWrite(LED_PIN, LOW);
-    delay(80);
-  }
-}
-
+// ── Setup ────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-
-  // Init NRF24L01
-  if (!radio.begin()) {
-    Serial.println("NRF24L01 not found!");
-    // Blink rapidly to indicate error
-    while (true) {
-      blink(5);
-      delay(500);
-    }
+  
+  // Wait for serial and USB to stabilize
+  delay(2000);
+  
+  // Clear any garbage in serial buffer
+  while(Serial.available()) {
+    Serial.read();
   }
-
+  
+  // Initialize NRF24L01
+  radio.begin();
   radio.setChannel(RF_CHANNEL);
-  radio.setPALevel(RF24_PA_MAX);       // Max power for range
-  radio.setDataRate(RF24_250KBPS);     // 250kbps for best range
-  radio.setRetries(5, 15);             // 5 retries, 15*250us delay
-  radio.setCRCLength(RF24_CRC_16);     // 16-bit CRC
-
+  radio.setPALevel(RF24_PA_MAX);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setCRCLength(RF24_CRC_16);
+  radio.setAutoAck(true);
+  radio.setRetries(5, 15);
+  
+  // Open pipes
   radio.openWritingPipe(WRITE_PIPE);
   radio.openReadingPipe(1, READ_PIPE);
-
-  radio.stopListening();               // Start in TX mode
-
+  
+  // Start listening
+  radio.startListening();
+  
+  // Send ready signal to GUI (ONLY THIS, NOTHING ELSE)
   Serial.println("CLARQ_RF_READY");
-  blink(3);
 }
 
-void loop() {
-  // ── Read command from GUI over USB serial ──────────────────
-  if (Serial.available() > 0) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
 
-    if (!line.startsWith("CMD:")) return;
 
-    int cmd_id = line.substring(4).toInt();
-
-    if (cmd_id < 1 || cmd_id > 11) {
-      Serial.println("ERR:INVALID_CMD");
-      return;
-    }
-
-    // Build packet
-    ClarqPacket pkt;
-    pkt.cmd_id   = (uint8_t)cmd_id;
-    pkt.checksum = pkt.cmd_id ^ 0xAA;
-
-    // Transmit over RF
-    radio.stopListening();
-    bool ok = radio.write(&pkt, sizeof(pkt));
-
-    if (ok) {
-      Serial.print("TX_OK:");
-      Serial.println(cmd_id);
-      blink(1);
-    } else {
-      Serial.print("TX_FAIL:");
-      Serial.println(cmd_id);
-      blink(3);
-    }
-
-    // Switch to RX briefly to catch PONG response
-    radio.startListening();
-    unsigned long start = millis();
-    while (millis() - start < 200) {
-      if (radio.available()) {
-        ClarqPacket resp;
-        radio.read(&resp, sizeof(resp));
-        // Validate checksum
-        if (resp.checksum == (resp.cmd_id ^ 0xAA)) {
-          Serial.print("RX:");
-          Serial.println(resp.cmd_id);
-          blink(2);
-        }
-        break;
-      }
-    }
-    radio.stopListening();
+// ── Handle Commands from GUI ────────────────────────────────
+void handleSerialCommand() {
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  
+  // Expected format: "CMD:<id>"
+  if (!line.startsWith("CMD:")) {
+    return;  // Silently ignore invalid format
   }
+  
+  // Extract command ID
+  int cmd_id = line.substring(4).toInt();
+  
+  // Validate command ID
+  if (cmd_id < 1 || cmd_id > 16) {
+    return;  // Silently ignore invalid ID
+  }
+  
+  // Build packet: [cmd_id, checksum]
+  uint8_t packet[2];
+  packet[0] = cmd_id;
+  packet[1] = cmd_id ^ 0xAA;  // Simple XOR checksum
+  
+  // Send to Jetson via nRF
+  radio.stopListening();
+  bool ok = radio.write(packet, 2);
+  radio.startListening();
+  
+  // Report to GUI
+  if (ok) {
+    Serial.print("TX_OK:");
+    Serial.println(cmd_id);
+  } else {
+    Serial.print("TX_FAIL:");
+    Serial.println(cmd_id);
+  }
+}
+
+// ── Handle Responses from Jetson ────────────────────────────
+void handleRadioResponse() {
+  uint8_t packet[2];
+  
+  // Read the data
+  radio.read(packet, 2);
+  
+  uint8_t status_id = packet[0];
+  uint8_t checksum  = packet[1];
+  
+  // Validate checksum
+  if (checksum != (status_id ^ 0xAA)) {
+    return;  // Silently ignore bad checksum
+  }
+  
+  // Forward to GUI
+  Serial.print("RX:");
+  Serial.println(status_id);
+}
+
+// ── Main Loop ────────────────────────────────────────────────
+void loop() {
+  // Check for commands from GUI (USB Serial)
+  if (Serial.available()) {
+    handleSerialCommand();
+  }
+  
+  // Check for responses from Jetson (nRF)
+  if (radio.available()) {
+    handleRadioResponse();
+  }
+  
+  delay(10);
 }
