@@ -21,3 +21,7 @@ desktop.ini
 *.svo
 *.svo2
 *.zed
+
+scans
+captures
+test *.png

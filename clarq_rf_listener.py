@@ -17,10 +17,13 @@
 #   9  = START_SCAN     → tmux window 3: python3 save_position.py
 #   10 = SAVE_END       → write .save_end_trigger file
 #   11 = GO_HOME        → tmux window 4: python3 return_land.py
+#   12 = START_3D_FUSION → start ZED Fusion + position tracking
+#   13 = STOP_3D_FUSION  → stop ZED Fusion recording
 #
 # Button → tmux window mapping (from launch_drone.sh):
 #   LAUNCH / LAUNCH SIM → new tmux session "drone" (all windows)
 #   START SCAN          → tmux window 3 (save_pos)
+#   START 3D FUSION     → new processes (fusion + position tracking)
 #   GO HOME + LAND      → tmux window 4 (return_land)
 #   KILL JETSON         → tmux kill-session drone
 #
@@ -68,41 +71,57 @@ SPI_BUS = 0              # SPI bus (0 or 1 depending on Jetson)
 SPI_DEV = 0              # SPI device (CS)
 
 # ── Command IDs ───────────────────────────────────────────────
-CMD_ID_PING       = 1
-CMD_ID_LAND       = 2
-CMD_ID_START_TAG  = 3
-CMD_ID_STOP_TAG   = 4
-CMD_ID_STOP_ALL   = 5
-CMD_ID_LAUNCH     = 6
-CMD_ID_LAUNCH_SIM = 7
-CMD_ID_SET_HOME   = 8
-CMD_ID_START_SCAN = 9
-CMD_ID_SAVE_END   = 10
-CMD_ID_GO_HOME    = 11
+CMD_ID_PING            = 1
+CMD_ID_LAND            = 2
+CMD_ID_START_TAG       = 3
+CMD_ID_STOP_TAG        = 4
+CMD_ID_STOP_ALL        = 5
+CMD_ID_LAUNCH          = 6
+CMD_ID_LAUNCH_SIM      = 7
+CMD_ID_SET_HOME        = 8
+CMD_ID_START_SCAN      = 9
+CMD_ID_SAVE_END        = 10
+CMD_ID_GO_HOME         = 11
+CMD_ID_START_3D_FUSION = 12
+CMD_ID_STOP_3D_FUSION  = 13
+CMD_ID_START_PHOTO     = 14
+CMD_ID_START_VIDEO     = 15
+CMD_ID_STOP_CAPTURE    = 16
 
 # ── Status response IDs (sent back to GUI via nRF) ────────────
 # Must match ARDUINO_RX_MAP in CLARQ_GUI.py
-STATUS_PONG         = CMD_ID_PING
-STATUS_LAND_ACK     = CMD_ID_LAND
-STATUS_TAG_RUNNING  = CMD_ID_START_TAG
-STATUS_TAG_STOPPED  = CMD_ID_STOP_TAG
-STATUS_ALL_STOPPED  = CMD_ID_STOP_ALL
-STATUS_LAUNCHED     = CMD_ID_LAUNCH
-STATUS_LAUNCHED_SIM = CMD_ID_LAUNCH_SIM
-STATUS_HOME_SET     = CMD_ID_SET_HOME
-STATUS_SCAN_STARTED = CMD_ID_START_SCAN
-STATUS_END_SAVED    = CMD_ID_SAVE_END
-STATUS_GOING_HOME   = CMD_ID_GO_HOME
+STATUS_PONG              = CMD_ID_PING
+STATUS_LAND_ACK          = CMD_ID_LAND
+STATUS_TAG_RUNNING       = CMD_ID_START_TAG
+STATUS_TAG_STOPPED       = CMD_ID_STOP_TAG
+STATUS_ALL_STOPPED       = CMD_ID_STOP_ALL
+STATUS_LAUNCHED          = CMD_ID_LAUNCH
+STATUS_LAUNCHED_SIM      = CMD_ID_LAUNCH_SIM
+STATUS_HOME_SET          = CMD_ID_SET_HOME
+STATUS_SCAN_STARTED      = CMD_ID_START_SCAN
+STATUS_END_SAVED         = CMD_ID_SAVE_END
+STATUS_GOING_HOME        = CMD_ID_GO_HOME
+STATUS_3D_FUSION_STARTED = CMD_ID_START_3D_FUSION
+STATUS_3D_FUSION_STOPPED = CMD_ID_STOP_3D_FUSION
+STATUS_PHOTO_STARTED     = CMD_ID_START_PHOTO
+STATUS_VIDEO_STARTED     = CMD_ID_START_VIDEO
+STATUS_CAPTURE_STOPPED   = CMD_ID_STOP_CAPTURE
 
 # ── Paths ─────────────────────────────────────────────────────
 BASE          = os.path.expanduser('~/ZED Navigation')
+ZED_NAV_DIR   = os.path.expanduser('~/ZED Navigation/ZED-Camera-Navigation')
 LAUNCH_SCRIPT = f'{BASE}/launch_drone.sh'
-RETURN_LAND   = f'{BASE}/ZED-Camera-Navigation/return_land.py'
-SAVE_POSITION = f'{BASE}/ZED-Camera-Navigation/save_position.py'
-ORIGIN_FILE   = f'{BASE}/ZED-Camera-Navigation/origin_T0.json'
-END_POS_FILE  = f'{BASE}/ZED-Camera-Navigation/scan_end_pos.json'
-TRIGGER_FILE  = f'{BASE}/ZED-Camera-Navigation/.save_end_trigger'
-TAGS_CONFIG   = f'{BASE}/ZED-Camera-Navigation/tags_config.yaml'
+RETURN_LAND   = f'{ZED_NAV_DIR}/return_land.py'
+SAVE_POSITION = f'{ZED_NAV_DIR}/save_position.py'
+ZED_FUSION    = f'{ZED_NAV_DIR}/zed_fusion_scan.py'
+ZED_PHOTO     = f'{ZED_NAV_DIR}/zed_photo_capture.py'
+ZED_VIDEO     = f'{ZED_NAV_DIR}/zed_video_capture.py'
+ORIGIN_FILE   = f'{ZED_NAV_DIR}/origin_T0.json'
+END_POS_FILE  = f'{ZED_NAV_DIR}/scan_end_pos.json'
+TRIGGER_FILE  = f'{ZED_NAV_DIR}/.save_end_trigger'
+TAGS_CONFIG   = f'{ZED_NAV_DIR}/tags_config.yaml'
+SCANS_DIR     = f'{ZED_NAV_DIR}/scans'
+CAPTURES_DIR  = f'{ZED_NAV_DIR}/captures'
 
 # ── ROS/ZED setup ─────────────────────────────────────────────
 ROS_SETUP  = 'source /opt/ros/humble/setup.bash'
@@ -116,6 +135,10 @@ TMUX_SESSION = 'drone'
 _apriltag_proc    = None
 _return_land_proc = None
 _scan_proc        = None
+_fusion_proc      = None
+_position_proc    = None
+_photo_proc       = None
+_video_proc       = None
 
 # ── nRF radio handle ──────────────────────────────────────────
 _radio = None
@@ -195,9 +218,7 @@ def _run(label, cmd):
 def _tmux_send(window, command):
     """Send a command to a specific tmux window."""
     subprocess.run(
-        f'tmux send-keys -t {TMUX_SESSION}:{window} '
-        f'"{command}" Enter',
-        shell=True)
+        ['tmux', 'send-keys', '-t', f'{TMUX_SESSION}:{window}', command, 'Enter'])
 
 
 def _tmux_running():
@@ -281,9 +302,9 @@ def handle_stop_all():
     """
     Button: KILL JETSON
     Kills the tmux session and all CLARQ processes.
-    Stops: ZED, AprilTag, save_position, return_land — everything.
+    Stops: ZED, AprilTag, save_position, return_land, fusion, photo, video — everything.
     """
-    global _return_land_proc, _scan_proc
+    global _return_land_proc, _scan_proc, _fusion_proc, _position_proc, _photo_proc, _video_proc
     print("  STOP ALL — killing drone tmux session + processes")
 
     _stop_apriltag()
@@ -291,6 +312,10 @@ def handle_stop_all():
     for proc, name in [
         (_return_land_proc, "return_land.py"),
         (_scan_proc,        "save_position.py"),
+        (_fusion_proc,      "zed_fusion_scan.py"),
+        (_position_proc,    "position tracking"),
+        (_photo_proc,       "photo capture"),
+        (_video_proc,       "video recording"),
     ]:
         if proc and proc.poll() is None:
             proc.terminate()
@@ -298,6 +323,10 @@ def handle_stop_all():
 
     _return_land_proc = None
     _scan_proc        = None
+    _fusion_proc      = None
+    _position_proc    = None
+    _photo_proc       = None
+    _video_proc       = None
 
     # Kill the entire tmux session (kills ZED, AprilTag, all windows)
     subprocess.run(
@@ -321,7 +350,7 @@ def handle_set_home():
         print("  ERROR: tmux session not running — launch first!")
         return
 
-    trigger = f'{BASE}/ZED-Camera-Navigation/.set_home_trigger'
+    trigger = f'{ZED_NAV_DIR}/.set_home_trigger'
     try:
         with open(trigger, 'w') as f:
             f.write(str(time.time()))
@@ -344,7 +373,7 @@ def handle_set_home():
 
 def handle_start_scan():
     """
-    Button: 2. START SCAN MISSION
+    Button: 2. START SCAN MISSION (legacy position-only tracking)
     Sends save_position.py command to tmux window 3 (save_pos).
     This script records drone position throughout the scan mission.
     The drone should already be flying the AUTO mission in MP.
@@ -355,11 +384,192 @@ def handle_start_scan():
         print("  ERROR: tmux session not running — launch first!")
         return
 
-    _tmux_send(3, f'{FULL_SETUP} && cd "{BASE}/ZED-Camera-Navigation" && python3 save_position.py')
+    _tmux_send(3, f'{FULL_SETUP} && python3 "{SAVE_POSITION}"')
     print("  save_position.py started in tmux window 3")
 
     time.sleep(2)
     send_status(STATUS_SCAN_STARTED)
+
+
+def handle_start_3d_fusion():
+    """
+    Button: 2. START 3D FUSION
+    Starts ZED Fusion 3D reconstruction + position tracking.
+    Records to .SVO file and tracks drone position simultaneously.
+    User flies the mission manually with Mission Planner.
+    """
+    global _fusion_proc, _position_proc
+    print("  START 3D FUSION — launching ZED Fusion + position tracking")
+
+    if not _tmux_running():
+        print("  ERROR: tmux session not running — launch first!")
+        return
+
+    # Create scans directory if it doesn't exist
+    os.makedirs(SCANS_DIR, exist_ok=True)
+
+    # Check if ZED Fusion script exists
+    if not os.path.exists(ZED_FUSION):
+        print(f"  ERROR: {ZED_FUSION} not found!")
+        print(f"  Create zed_fusion_scan.py first!")
+        return
+
+    # Start ZED Fusion recording
+    print(f"  Starting ZED Fusion: {ZED_FUSION}")
+    _fusion_proc = _run(
+        "ZED Fusion",
+        f'python3 "{ZED_FUSION}"'
+    )
+
+    time.sleep(1)
+
+    # Start position tracking
+    print(f"  Starting position tracking: {SAVE_POSITION}")
+    _position_proc = _run(
+        "Position tracking",
+        f'bash -c "{FULL_SETUP} && python3 \\"{SAVE_POSITION}\\""'
+    )
+
+    if _fusion_proc and _position_proc:
+        print("  ✓ 3D Fusion + position tracking active")
+        send_status(STATUS_3D_FUSION_STARTED)
+    else:
+        print("  ERROR: Failed to start one or both processes")
+
+
+def handle_stop_3d_fusion():
+    """
+    Button: STOP 3D FUSION
+    Stops ZED Fusion recording and position tracking.
+    Saves the .SVO file and 3D mesh.
+    """
+    global _fusion_proc, _position_proc
+    print("  STOP 3D FUSION — terminating processes")
+
+    stopped = False
+
+    if _fusion_proc and _fusion_proc.poll() is None:
+        print("  Stopping ZED Fusion...")
+        _fusion_proc.terminate()
+        _fusion_proc.wait(timeout=5)
+        _fusion_proc = None
+        stopped = True
+
+    if _position_proc and _position_proc.poll() is None:
+        print("  Stopping position tracking...")
+        _position_proc.terminate()
+        _position_proc.wait(timeout=5)
+        _position_proc = None
+        stopped = True
+
+    if stopped:
+        print("  ✓ 3D Fusion recording saved")
+        send_status(STATUS_3D_FUSION_STOPPED)
+    else:
+        print("  No fusion processes were running")
+        send_status(STATUS_3D_FUSION_STOPPED)
+
+
+def handle_start_photo(quality="HIGH"):
+    """
+    Button: PHOTO MODE
+    Starts photo capture with specified quality.
+    Quality options: LOW, MEDIUM, HIGH, ULTRA
+    """
+    global _photo_proc
+    print(f"  START PHOTO CAPTURE — Quality: {quality}")
+
+    if not _tmux_running():
+        print("  ERROR: tmux session not running — launch first!")
+        return
+
+    # Create captures directory
+    os.makedirs(CAPTURES_DIR, exist_ok=True)
+
+    # Check if script exists
+    if not os.path.exists(ZED_PHOTO):
+        print(f"  ERROR: {ZED_PHOTO} not found!")
+        return
+
+    # Start photo capture
+    print(f"  Starting photo capture: {ZED_PHOTO}")
+    _photo_proc = _run(
+        f"Photo capture ({quality})",
+        f'python3 "{ZED_PHOTO}" {quality}'
+    )
+
+    if _photo_proc:
+        print(f"  ✓ Photo capture active ({quality})")
+        send_status(STATUS_PHOTO_STARTED)
+    else:
+        print("  ERROR: Failed to start photo capture")
+
+
+def handle_start_video(quality="HIGH"):
+    """
+    Button: VIDEO MODE
+    Starts video recording with specified quality.
+    Quality options: LOW, MEDIUM, HIGH, ULTRA
+    """
+    global _video_proc
+    print(f"  START VIDEO RECORDING — Quality: {quality}")
+
+    if not _tmux_running():
+        print("  ERROR: tmux session not running — launch first!")
+        return
+
+    # Create captures directory
+    os.makedirs(CAPTURES_DIR, exist_ok=True)
+
+    # Check if script exists
+    if not os.path.exists(ZED_VIDEO):
+        print(f"  ERROR: {ZED_VIDEO} not found!")
+        return
+
+    # Start video recording
+    print(f"  Starting video recording: {ZED_VIDEO}")
+    _video_proc = _run(
+        f"Video recording ({quality})",
+        f'python3 "{ZED_VIDEO}" {quality}'
+    )
+
+    if _video_proc:
+        print(f"  ✓ Video recording active ({quality})")
+        send_status(STATUS_VIDEO_STARTED)
+    else:
+        print("  ERROR: Failed to start video recording")
+
+
+def handle_stop_capture():
+    """
+    Button: STOP CAPTURE
+    Stops photo or video capture.
+    """
+    global _photo_proc, _video_proc
+    print("  STOP CAPTURE — terminating processes")
+
+    stopped = False
+
+    if _photo_proc and _photo_proc.poll() is None:
+        print("  Stopping photo capture...")
+        _photo_proc.terminate()
+        _photo_proc.wait(timeout=5)
+        _photo_proc = None
+        stopped = True
+
+    if _video_proc and _video_proc.poll() is None:
+        print("  Stopping video recording...")
+        _video_proc.terminate()
+        _video_proc.wait(timeout=5)
+        _video_proc = None
+        stopped = True
+
+    if stopped:
+        print("  ✓ Capture stopped, files saved")
+        send_status(STATUS_CAPTURE_STOPPED)
+    else:
+        print("  No capture processes were running")
+        send_status(STATUS_CAPTURE_STOPPED)
 
 
 def handle_save_end():
@@ -422,7 +632,7 @@ def handle_go_home():
     time.sleep(2)
 
     # Start return_land.py in tmux window 4
-    _tmux_send(4, f'{FULL_SETUP} && cd "{BASE}/ZED-Camera-Navigation" && python3 return_land.py')
+    _tmux_send(4, f'{FULL_SETUP} && python3 "{RETURN_LAND}"')
     print("  return_land.py started in tmux window 4")
 
     send_status(STATUS_GOING_HOME)
@@ -455,7 +665,7 @@ def handle_land():
         print("  ERROR: tmux session not running!")
         return
 
-    _tmux_send(4, f'{FULL_SETUP} && cd "{BASE}/ZED-Camera-Navigation" && python3 return_land.py')
+    _tmux_send(4, f'{FULL_SETUP} && python3 "{RETURN_LAND}"')
     send_status(STATUS_LAND_ACK)
 
 
@@ -477,17 +687,30 @@ def dispatch(cmd_id):
 
     # These run in background threads (may take time)
     thread_map = {
-        CMD_ID_LAND:       handle_land,
-        CMD_ID_START_TAG:  handle_start_tag,
-        CMD_ID_LAUNCH:     handle_launch,
-        CMD_ID_SET_HOME:   handle_set_home,
-        CMD_ID_START_SCAN: handle_start_scan,
-        CMD_ID_GO_HOME:    handle_go_home,
+        CMD_ID_LAND:            handle_land,
+        CMD_ID_START_TAG:       handle_start_tag,
+        CMD_ID_LAUNCH:          handle_launch,
+        CMD_ID_SET_HOME:        handle_set_home,
+        CMD_ID_START_SCAN:      handle_start_scan,
+        CMD_ID_START_3D_FUSION: handle_start_3d_fusion,
+        CMD_ID_STOP_3D_FUSION:  handle_stop_3d_fusion,
+        CMD_ID_STOP_CAPTURE:    handle_stop_capture,
+        CMD_ID_GO_HOME:         handle_go_home,
     }
 
     if cmd_id == CMD_ID_LAUNCH_SIM:
         threading.Thread(
             target=lambda: handle_launch(sim=True),
+            daemon=True).start()
+    elif cmd_id == CMD_ID_START_PHOTO:
+        # Photo capture with quality parameter (if sent)
+        threading.Thread(
+            target=lambda: handle_start_photo("HIGH"),
+            daemon=True).start()
+    elif cmd_id == CMD_ID_START_VIDEO:
+        # Video recording with quality parameter (if sent)
+        threading.Thread(
+            target=lambda: handle_start_video("HIGH"),
             daemon=True).start()
     elif cmd_id in sync_map:
         sync_map[cmd_id]()
@@ -529,7 +752,7 @@ def rf_listen_loop(radio):
                           f"expected {cmd_id ^ 0xAA:#x}")
                     continue
 
-                if not 1 <= cmd_id <= 11:
+                if not 1 <= cmd_id <= 16:
                     print(f"[nRF] Out of range cmd_id: {cmd_id}")
                     continue
 
