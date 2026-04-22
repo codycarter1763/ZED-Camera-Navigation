@@ -77,6 +77,10 @@ TAGS_CONFIG   = f'{ZED_NAV_DIR}/tags_config.yaml'
 SCANS_DIR     = f'{ZED_NAV_DIR}/scans'
 CAPTURES_DIR  = f'{ZED_NAV_DIR}/captures'
 
+# ── Gimbal serial port (Jetson → SimpleBGC controller) ────────
+GIMBAL_PORT = "/dev/ttyACM2"   # adjust if port differs on your Jetson
+GIMBAL_BAUD = 115200
+
 # ── ROS/ZED setup ─────────────────────────────────────────────
 ROS_SETUP  = 'source /opt/ros/humble/setup.bash'
 ZED_SETUP  = 'source ~/ros2_ws/install/setup.bash'
@@ -115,7 +119,10 @@ def init_radio():
     radio.setDataRate(RF24_250KBPS)
     radio.setCRCLength(RF24_CRC_16)
     radio.openReadingPipe(1, READ_PIPE)
-    radio.openWritingPipe(WRITE_PIPE)
+
+    # Use new pyrf24 API — pass TX address directly to stopListening()
+    # Replaces the deprecated openWritingPipe() call
+    radio.stopListening(WRITE_PIPE)
     radio.startListening()
 
     _radio = radio
@@ -137,15 +144,13 @@ def send_status(status_id):
     if _radio is None:
         return
     try:
-        import time
         checksum = status_id ^ 0xAA
         payload  = bytes([status_id, checksum])
 
-        # Give radio time to transition from RX to TX
-        _radio.stopListening()
-        time.sleep(0.01)  # 10ms delay for state transition
-        
-        # Try up to 3 times
+        # Use new pyrf24 API — pass TX address directly to stopListening()
+        _radio.stopListening(WRITE_PIPE)
+        time.sleep(0.01)
+
         for attempt in range(3):
             ok = _radio.write(payload)
             if ok:
@@ -155,15 +160,14 @@ def send_status(status_id):
                 time.sleep(0.01)
         else:
             print(f"[nRF] Status send failed: id={status_id}")
-        
-        # Return to listening mode
+
         time.sleep(0.01)
         _radio.startListening()
-        
+
     except Exception as e:
         print(f"[nRF] send_status error: {e}")
         try:
-            _radio.startListening()  # Ensure we return to listening
+            _radio.startListening()
         except:
             pass
 
@@ -224,8 +228,7 @@ def _stop_apriltag():
         _apriltag_proc.terminate()
         _apriltag_proc = None
         print("  AprilTag stopped")
-    subprocess.run('pkill -f apriltag_node 2>/dev/null',
-                   shell=True)
+    subprocess.run('pkill -f apriltag_node 2>/dev/null', shell=True)
     send_status(STATUS_TAG_STOPPED)
 
 
@@ -234,23 +237,13 @@ def _stop_apriltag():
 # ═══════════════════════════════════════════════════════════════
 
 def handle_ping():
-    """Button: PING JETSON — confirms Jetson is alive."""
+    """Confirms Jetson is alive."""
     print("  PING → sending PONG")
     send_status(STATUS_PONG)
 
 
 def handle_launch(sim=False):
-    """
-    Button: LAUNCH JETSON / LAUNCH JETSON SIM
-    Runs launch_drone.sh which creates a tmux session 'drone'
-    with windows:
-      0 = zed camera (or sitl bridge)
-      1 = apriltag
-      2 = set_origin.py
-      3 = save_position.py (ready to run)
-      4 = return_land.py   (ready to run)
-      5 = monitor terminal
-    """
+    """Runs launch_drone.sh to create the tmux session."""
     mode = "SIM" if sim else "REAL"
     print(f"  LAUNCH ({mode}) — running launch_drone.sh")
 
@@ -259,9 +252,7 @@ def handle_launch(sim=False):
         return
 
     flag = "--sim" if sim else ""
-    subprocess.Popen(
-        f'bash "{LAUNCH_SCRIPT}" {flag}',
-        shell=True)
+    subprocess.Popen(f'bash "{LAUNCH_SCRIPT}" {flag}', shell=True)
 
     time.sleep(1)
     status = STATUS_LAUNCHED_SIM if sim else STATUS_LAUNCHED
@@ -269,12 +260,9 @@ def handle_launch(sim=False):
 
 
 def handle_stop_all():
-    """
-    Button: KILL JETSON
-    Kills the tmux session and all CLARQ processes.
-    Stops: ZED, AprilTag, save_position, return_land, fusion, photo, video — everything.
-    """
-    global _return_land_proc, _scan_proc, _fusion_proc, _position_proc, _photo_proc, _video_proc
+    """Kills the tmux session and all CLARQ processes."""
+    global _return_land_proc, _scan_proc, _fusion_proc, \
+           _position_proc, _photo_proc, _video_proc
     print("  STOP ALL — killing drone tmux session + processes")
 
     _stop_apriltag()
@@ -298,7 +286,6 @@ def handle_stop_all():
     _photo_proc       = None
     _video_proc       = None
 
-    # Kill the entire tmux session (kills ZED, AprilTag, all windows)
     subprocess.run(
         f'tmux kill-session -t {TMUX_SESSION} 2>/dev/null',
         shell=True)
@@ -309,7 +296,6 @@ def handle_stop_all():
 
 def handle_set_home():
     """
-    Button: 1. SET HOME POINT
     Writes a trigger file that set_origin.py watches for.
     set_origin.py detects the file, saves current ZED pose
     as origin_T0.json, then deletes the trigger file.
@@ -333,20 +319,17 @@ def handle_set_home():
         time.sleep(3)
         if os.path.exists(ORIGIN_FILE):
             print("  origin_T0.json confirmed ✓")
-            send_status(STATUS_HOME_SET)
         else:
             print("  WARNING: origin_T0.json not found after 3s")
-            send_status(STATUS_HOME_SET)
+        send_status(STATUS_HOME_SET)
 
     threading.Thread(target=_confirm, daemon=True).start()
 
 
 def handle_start_scan():
     """
-    Button: 2. START SCAN MISSION (legacy position-only tracking)
-    Sends save_position.py command to tmux window 3 (save_pos).
-    This script records drone position throughout the scan mission.
-    The drone should already be flying the AUTO mission in MP.
+    Sends save_position.py command to tmux window 3.
+    Legacy position-only tracking (no 3D reconstruction).
     """
     print("  START SCAN — running save_position.py in tmux window 3")
 
@@ -363,10 +346,8 @@ def handle_start_scan():
 
 def handle_start_3d_fusion():
     """
-    Button: 2. START 3D FUSION
     Starts ZED Fusion 3D reconstruction + position tracking.
     Records to .SVO file and tracks drone position simultaneously.
-    User flies the mission manually with Mission Planner.
     """
     global _fusion_proc, _position_proc
     print("  START 3D FUSION — launching ZED Fusion + position tracking")
@@ -375,25 +356,17 @@ def handle_start_3d_fusion():
         print("  ERROR: tmux session not running — launch first!")
         return
 
-    # Create scans directory if it doesn't exist
     os.makedirs(SCANS_DIR, exist_ok=True)
 
-    # Check if ZED Fusion script exists
     if not os.path.exists(ZED_FUSION):
         print(f"  ERROR: {ZED_FUSION} not found!")
-        print(f"  Create zed_fusion_scan.py first!")
         return
 
-    # Start ZED Fusion recording
     print(f"  Starting ZED Fusion: {ZED_FUSION}")
-    _fusion_proc = _run(
-        "ZED Fusion",
-        f'python3 "{ZED_FUSION}"'
-    )
+    _fusion_proc = _run("ZED Fusion", f'python3 "{ZED_FUSION}"')
 
     time.sleep(1)
 
-    # Start position tracking
     print(f"  Starting position tracking: {SAVE_POSITION}")
     _position_proc = _run(
         "Position tracking",
@@ -408,11 +381,7 @@ def handle_start_3d_fusion():
 
 
 def handle_stop_3d_fusion():
-    """
-    Button: STOP 3D FUSION
-    Stops ZED Fusion recording and position tracking.
-    Saves the .SVO file and 3D mesh.
-    """
+    """Stops ZED Fusion recording and position tracking."""
     global _fusion_proc, _position_proc
     print("  STOP 3D FUSION — terminating processes")
 
@@ -434,18 +403,14 @@ def handle_stop_3d_fusion():
 
     if stopped:
         print("  ✓ 3D Fusion recording saved")
-        send_status(STATUS_3D_FUSION_STOPPED)
     else:
         print("  No fusion processes were running")
-        send_status(STATUS_3D_FUSION_STOPPED)
+
+    send_status(STATUS_3D_FUSION_STOPPED)
 
 
 def handle_start_photo(quality="HIGH"):
-    """
-    Button: PHOTO MODE
-    Starts photo capture with specified quality.
-    Quality options: LOW, MEDIUM, HIGH, ULTRA
-    """
+    """Starts photo capture at the specified quality setting."""
     global _photo_proc
     print(f"  START PHOTO CAPTURE — Quality: {quality}")
 
@@ -453,16 +418,12 @@ def handle_start_photo(quality="HIGH"):
         print("  ERROR: tmux session not running — launch first!")
         return
 
-    # Create captures directory
     os.makedirs(CAPTURES_DIR, exist_ok=True)
 
-    # Check if script exists
     if not os.path.exists(ZED_PHOTO):
         print(f"  ERROR: {ZED_PHOTO} not found!")
         return
 
-    # Start photo capture
-    print(f"  Starting photo capture: {ZED_PHOTO}")
     _photo_proc = _run(
         f"Photo capture ({quality})",
         f'python3 "{ZED_PHOTO}" {quality}'
@@ -476,11 +437,7 @@ def handle_start_photo(quality="HIGH"):
 
 
 def handle_start_video(quality="HIGH"):
-    """
-    Button: VIDEO MODE
-    Starts video recording with specified quality.
-    Quality options: LOW, MEDIUM, HIGH, ULTRA
-    """
+    """Starts video recording at the specified quality setting."""
     global _video_proc
     print(f"  START VIDEO RECORDING — Quality: {quality}")
 
@@ -488,16 +445,12 @@ def handle_start_video(quality="HIGH"):
         print("  ERROR: tmux session not running — launch first!")
         return
 
-    # Create captures directory
     os.makedirs(CAPTURES_DIR, exist_ok=True)
 
-    # Check if script exists
     if not os.path.exists(ZED_VIDEO):
         print(f"  ERROR: {ZED_VIDEO} not found!")
         return
 
-    # Start video recording
-    print(f"  Starting video recording: {ZED_VIDEO}")
     _video_proc = _run(
         f"Video recording ({quality})",
         f'python3 "{ZED_VIDEO}" {quality}'
@@ -511,10 +464,7 @@ def handle_start_video(quality="HIGH"):
 
 
 def handle_stop_capture():
-    """
-    Button: STOP CAPTURE
-    Stops photo or video capture.
-    """
+    """Stops photo or video capture and saves files."""
     global _photo_proc, _video_proc
     print("  STOP CAPTURE — terminating processes")
 
@@ -536,71 +486,64 @@ def handle_stop_capture():
 
     if stopped:
         print("  ✓ Capture stopped, files saved")
-        send_status(STATUS_CAPTURE_STOPPED)
     else:
         print("  No capture processes were running")
-        send_status(STATUS_CAPTURE_STOPPED)
+
+    send_status(STATUS_CAPTURE_STOPPED)
 
 
 def handle_set_gimbal(angle=0):
     """
-    Button: SET GIMBAL
-    Sets gimbal pitch angle via serial connection to SimpleBGC controller.
-    Angle parameter is sent from GUI via RF.
+    Sets gimbal pitch angle via serial to SimpleBGC controller.
+    Jetson → /dev/ttyACM2 → SimpleBGC → gimbal motor.
     """
     print(f"  SET GIMBAL — Angle: {angle}°")
-    
-    # Gimbal serial port (adjust if needed)
-    GIMBAL_PORT = "/dev/ttyACM2"  # Change to your gimbal's serial port
-    GIMBAL_BAUD = 115200
-    
+
     try:
         import serial
         import struct
-        import time
-        
-        # Open gimbal serial connection
+
         gimbal = serial.Serial(GIMBAL_PORT, GIMBAL_BAUD, timeout=1)
         time.sleep(0.1)
-        
-        # Send gimbal control command (SimpleBGC protocol)
-        # Mode 2: absolute angle control
-        mode = 2
-        pitch = int(angle / 0.02197265625)
-        data = struct.pack('<Bhhhhhh', mode, 0, 0, 300, pitch, 0, 0)
-        
-        # Build packet
-        cmd_id = 67  # CMD_CONTROL
-        size = len(data)
+
+        # CMD_CONTROL (id=67), Mode 2: absolute angle
+        cmd_id = 67
+        mode   = 2
+        pitch  = int(angle / 0.02197265625)
+        data   = struct.pack('<Bhhhhhh', mode, 0, 0, 300, pitch, 0, 0)
+
+        size            = len(data)
         header_checksum = (cmd_id + size) & 0xFF
-        body_checksum = sum(data) & 0xFF
-        packet = bytes([0x3E, cmd_id, size, header_checksum]) + data + bytes([body_checksum])
-        
+        body_checksum   = sum(data) & 0xFF
+        packet = (bytes([0x3E, cmd_id, size, header_checksum])
+                  + data + bytes([body_checksum]))
+
         gimbal.write(packet)
         time.sleep(0.5)
-        
-        # Mode 0: release control (drift correction)
+
+        # Mode 0: release control (allows drift correction)
         mode = 0
         data = struct.pack('<Bhhhhhh', mode, 0, 0, 0, 0, 0, 0)
-        size = len(data)
+        size            = len(data)
         header_checksum = (cmd_id + size) & 0xFF
-        body_checksum = sum(data) & 0xFF
-        packet = bytes([0x3E, cmd_id, size, header_checksum]) + data + bytes([body_checksum])
-        
+        body_checksum   = sum(data) & 0xFF
+        packet = (bytes([0x3E, cmd_id, size, header_checksum])
+                  + data + bytes([body_checksum]))
+
         gimbal.write(packet)
         gimbal.close()
-        
+
         print(f"  ✓ Gimbal set to {angle}°")
         send_status(STATUS_GIMBAL_SET)
-        
+
     except Exception as e:
         print(f"  ERROR: Gimbal control failed: {e}")
-        send_status(STATUS_GIMBAL_SET)  # Send status anyway
+        print(f"  Check that SimpleBGC is connected on {GIMBAL_PORT}")
+        send_status(STATUS_GIMBAL_SET)
 
 
 def handle_save_end():
     """
-    Button: 3. SAVE END POINT
     Writes a trigger file that save_position.py watches for.
     When detected, save_position.py snapshots the current
     position as scan_end_pos.json and stops recording.
@@ -609,8 +552,7 @@ def handle_save_end():
 
     def _snap():
         try:
-            os.makedirs(os.path.dirname(TRIGGER_FILE),
-                        exist_ok=True)
+            os.makedirs(os.path.dirname(TRIGGER_FILE), exist_ok=True)
             with open(TRIGGER_FILE, 'w') as f:
                 f.write(str(time.time()))
             print(f"  Trigger written → {TRIGGER_FILE}")
@@ -624,17 +566,14 @@ def handle_save_end():
 
 def handle_go_home():
     """
-    Button: 4. GO HOME + LAND
-    Runs return_land.py in tmux window 4 (return_land).
-    Also starts AprilTag for precision landing.
-    Requires origin_T0.json to exist (SET HOME must have run).
+    Runs return_land.py in tmux window 4 and starts AprilTag.
+    Requires origin_T0.json to exist (SET HOME must have run first).
 
     return_land.py phases:
       Phase 1 — ZED navigate back to origin_T0 position
       Phase 2 — AprilTag align at 90° above tag
       Phase 3 — Land on rover
     """
-    global _return_land_proc
     print("  GO HOME — starting return_land.py + AprilTag")
 
     if not _tmux_running():
@@ -647,12 +586,13 @@ def handle_go_home():
         return
 
     # Start AprilTag in tmux window 1
-    _tmux_send(1, f'{FULL_SETUP} && ros2 run apriltag_ros apriltag_node '
-                  f'--ros-args '
-                  f'-r image_rect:=/zed/zed_node/rgb/color/rect/image '
-                  f'-r camera_info:=/zed/zed_node/left/color/rect/camera_info '
-                  f'-r detections:=/detections '
-                  f'--params-file "{TAGS_CONFIG}"')
+    _tmux_send(1, (
+        f'{FULL_SETUP} && ros2 run apriltag_ros apriltag_node --ros-args '
+        f'-r image_rect:=/zed/zed_node/rgb/color/rect/image '
+        f'-r camera_info:=/zed/zed_node/left/color/rect/camera_info '
+        f'-r detections:=/detections '
+        f'--params-file "{TAGS_CONFIG}"'
+    ))
     print("  AprilTag started in tmux window 1")
 
     time.sleep(2)
@@ -665,22 +605,21 @@ def handle_go_home():
 
 
 def handle_start_tag():
-    """Button: START APRILTAG (standalone)."""
+    """Start AprilTag node standalone."""
     print("  START TAG")
     _start_apriltag()
 
 
 def handle_stop_tag():
-    """Button: STOP APRILTAG."""
+    """Stop AprilTag node."""
     print("  STOP TAG")
     _stop_apriltag()
 
 
 def handle_land():
     """
-    Button: LAND
     Shortcut — starts AprilTag and return_land immediately.
-    Same as GO HOME but skips ZED navigation phase.
+    Skips ZED Phase 1 navigation, goes straight to AprilTag alignment.
     """
     global _return_land_proc
     print("  LAND — AprilTag + return_land.py")
@@ -703,7 +642,7 @@ def dispatch(cmd_id):
     print(f"  COMMAND: {cmd_id}")
     print(f"{'='*44}")
 
-    # These run on the main thread (fast, no blocking)
+    # Run on main thread (fast, non-blocking)
     sync_map = {
         CMD_ID_PING:     handle_ping,
         CMD_ID_STOP_TAG: handle_stop_tag,
@@ -711,7 +650,7 @@ def dispatch(cmd_id):
         CMD_ID_SAVE_END: handle_save_end,
     }
 
-    # These run in background threads (may take time)
+    # Run in background thread (may take time)
     thread_map = {
         CMD_ID_LAND:            handle_land,
         CMD_ID_START_TAG:       handle_start_tag,
@@ -720,28 +659,16 @@ def dispatch(cmd_id):
         CMD_ID_START_SCAN:      handle_start_scan,
         CMD_ID_START_3D_FUSION: handle_start_3d_fusion,
         CMD_ID_STOP_3D_FUSION:  handle_stop_3d_fusion,
+        CMD_ID_START_PHOTO:     lambda: handle_start_photo("HIGH"),
+        CMD_ID_START_VIDEO:     lambda: handle_start_video("HIGH"),
         CMD_ID_STOP_CAPTURE:    handle_stop_capture,
         CMD_ID_GO_HOME:         handle_go_home,
+        CMD_ID_SET_GIMBAL:      lambda: handle_set_gimbal(0),
     }
 
     if cmd_id == CMD_ID_LAUNCH_SIM:
         threading.Thread(
             target=lambda: handle_launch(sim=True),
-            daemon=True).start()
-    elif cmd_id == CMD_ID_START_PHOTO:
-        # Photo capture with quality parameter (if sent)
-        threading.Thread(
-            target=lambda: handle_start_photo("HIGH"),
-            daemon=True).start()
-    elif cmd_id == CMD_ID_START_VIDEO:
-        # Video recording with quality parameter (if sent)
-        threading.Thread(
-            target=lambda: handle_start_video("HIGH"),
-            daemon=True).start()
-    elif cmd_id == CMD_ID_SET_GIMBAL:
-        # Gimbal angle control - angle will be parsed from payload if available
-        threading.Thread(
-            target=lambda: handle_set_gimbal(0),  # TODO: parse angle from payload
             daemon=True).start()
     elif cmd_id in sync_map:
         sync_map[cmd_id]()
@@ -790,7 +717,7 @@ def rf_listen_loop(radio):
                 dispatch(cmd_id)
 
             else:
-                time.sleep(0.01)  # 10ms poll interval
+                time.sleep(0.01)
 
         except Exception as e:
             print(f"[nRF] Receive error: {e}")
@@ -805,17 +732,15 @@ if __name__ == '__main__':
     print("  CLARQ Command Listener")
     print("  Transport: NRF24L01")
     print(f"  Base path: {BASE}")
+    print(f"  Gimbal port: {GIMBAL_PORT}")
     print("=" * 44)
 
-    # Check tmux is available
     if subprocess.run('which tmux', shell=True,
                       capture_output=True).returncode != 0:
         print("WARNING: tmux not found — install with: sudo apt install tmux")
 
-    # Init radio
     radio = init_radio()
 
-    # Start listening — blocks forever
     try:
         rf_listen_loop(radio)
     except KeyboardInterrupt:
