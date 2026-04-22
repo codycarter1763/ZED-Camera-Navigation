@@ -4,23 +4,29 @@ import subprocess
 import sys
 import threading
 import time
+import serial
 
 # Force unbuffered output for systemd journal / SSH viewing
 os.environ['PYTHONUNBUFFERED'] = '1'
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# ── nRF24L01 ──────────────────────────────────────────────────
-from pyrf24 import RF24, RF24_PA_MAX, RF24_250KBPS, RF24_CRC_16
-
-# Must match clarq_rf_arduino.ino exactly
-RF_CHANNEL  = 100
-READ_PIPE   = b"CLARQ"   # Arduino → Jetson (commands in)
-WRITE_PIPE  = b"JTSN0"   # Jetson → Arduino (ACK/status out)
-
-CE_PIN  = 18             # BCM GPIO pin
-SPI_BUS = 0              # SPI bus (0 or 1 depending on Jetson)
-SPI_DEV = 0              # SPI device (CS)
+# ── RYLR998 LoRa UART Config ──────────────────────────────────
+LORA_PORT       = "/dev/ttyTHS1"   # Jetson UART — adjust if needed
+                                    # Common options:
+                                    #   /dev/ttyTHS1  (Jetson Nano J41 header)
+                                    #   /dev/ttyTHS0
+                                    #   /dev/ttyUSB0  (USB-UART adapter)
+LORA_BAUD       = 115200           # Must match Arduino sketch
+LORA_NETWORK_ID = 18               # Must match Arduino sketch
+LORA_ADDRESS    = 11               # This node (Jetson)
+LORA_DEST_ADDR  = 10               # Remote node (Arduino)
+LORA_BAND       = 915000000        # Hz — use 868000000 for EU
+LORA_SF         = 9
+LORA_BANDWIDTH  = 7
+LORA_CR         = 1
+LORA_PREAMBLE   = 4
+LORA_POWER      = 22
 
 # ── Command IDs ───────────────────────────────────────────────
 CMD_ID_PING            = 1
@@ -41,8 +47,7 @@ CMD_ID_START_VIDEO     = 15
 CMD_ID_STOP_CAPTURE    = 16
 CMD_ID_SET_GIMBAL      = 17
 
-# ── Status response IDs (sent back to GUI via nRF) ────────────
-# Must match ARDUINO_RX_MAP in CLARQ_GUI.py
+# ── Status response IDs (sent back to GUI via LoRa) ───────────
 STATUS_PONG              = CMD_ID_PING
 STATUS_LAND_ACK          = CMD_ID_LAND
 STATUS_TAG_RUNNING       = CMD_ID_START_TAG
@@ -77,16 +82,14 @@ TAGS_CONFIG   = f'{ZED_NAV_DIR}/tags_config.yaml'
 SCANS_DIR     = f'{ZED_NAV_DIR}/scans'
 CAPTURES_DIR  = f'{ZED_NAV_DIR}/captures'
 
-# ── Gimbal serial port (Jetson → SimpleBGC controller) ────────
-GIMBAL_PORT = "/dev/ttyACM2"   # adjust if port differs on your Jetson
+# ── Gimbal serial port ────────────────────────────────────────
+GIMBAL_PORT = "/dev/ttyACM2"
 GIMBAL_BAUD = 115200
 
 # ── ROS/ZED setup ─────────────────────────────────────────────
 ROS_SETUP  = 'source /opt/ros/humble/setup.bash'
 ZED_SETUP  = 'source ~/ros2_ws/install/setup.bash'
 FULL_SETUP = f'{ROS_SETUP} && {ZED_SETUP}'
-
-# tmux session name (must match launch_drone.sh)
 TMUX_SESSION = 'drone'
 
 # ── Process handles ───────────────────────────────────────────
@@ -98,87 +101,141 @@ _position_proc    = None
 _photo_proc       = None
 _video_proc       = None
 
-# ── nRF radio handle ──────────────────────────────────────────
-_radio = None
+# ── LoRa serial handle + lock ─────────────────────────────────
+_lora: serial.Serial | None = None
+_lora_lock = threading.Lock()   # Serialize AT commands (TX blocks RX)
 
 
 # ═══════════════════════════════════════════════════════════════
-# NRF24 INIT
+# RYLR998 INIT
 # ═══════════════════════════════════════════════════════════════
-def init_radio():
-    global _radio
-    print("[nRF] Initializing NRF24L01...")
-    radio = RF24(CE_PIN, SPI_BUS * 10 + SPI_DEV)
+def _send_at(ser: serial.Serial, cmd: str, timeout: float = 3.0) -> bool:
+    """
+    Send a single AT command and wait for +OK or +ERR.
+    Caller must hold _lora_lock.
+    """
+    # Flush stale bytes
+    ser.reset_input_buffer()
 
-    if not radio.begin():
-        print("[nRF] ERROR: NRF24L01 not found — check wiring!")
-        sys.exit(1)
+    ser.write((cmd + "\r\n").encode())
 
-    radio.setChannel(RF_CHANNEL)
-    radio.setPALevel(RF24_PA_MAX)
-    radio.setDataRate(RF24_250KBPS)
-    radio.setCRCLength(RF24_CRC_16)
-    radio.setAutoAck(True)
-    radio.setRetries(5, 15)
-    radio.openReadingPipe(1, READ_PIPE)
+    deadline = time.time() + timeout
+    resp = ""
+    while time.time() < deadline:
+        if ser.in_waiting:
+            resp += ser.read(ser.in_waiting).decode(errors="ignore")
+        if "+OK"  in resp: return True
+        if "+ERR" in resp: return False
+        time.sleep(0.05)
+    return False  # Timeout
 
-    # Use new pyrf24 API — pass TX address directly to stopListening()
-    # Replaces the deprecated openWritingPipe() call
-    radio.stopListening(WRITE_PIPE)
-    radio.startListening()
 
-    _radio = radio
-    print(f"[nRF] Ready — listening on channel {RF_CHANNEL} ✓")
-    return radio
+def init_lora() -> serial.Serial:
+    global _lora
+    print("[LoRa] Initialising RYLR998...")
 
+    ser = serial.Serial(LORA_PORT, 115200, timeout=1)
+    time.sleep(0.5)
+
+    cmds = [
+        ("AT+RESET",    2.0),
+        (f"AT+ADDRESS={LORA_ADDRESS}",                                          1.0),
+        (f"AT+NETWORKID={LORA_NETWORK_ID}",                                     1.0),
+        (f"AT+BAND={LORA_BAND}",                                                1.0),
+        (f"AT+PARAMETER={LORA_SF},{LORA_BANDWIDTH},{LORA_CR},{LORA_PREAMBLE}", 1.0),
+        (f"AT+CRFOP={LORA_POWER}",                                              1.0),
+    ]
+
+    for cmd, wait in cmds:
+        time.sleep(0.3)
+        ok = _send_at(ser, cmd, timeout=wait + 1)
+        print(f"  {cmd}  →  {'✓' if ok else 'WARN (no +OK)'}")
+
+    _lora = ser
+    print(f"[LoRa] Ready on {LORA_PORT} @ 115200 baud ✓")
+    return ser
 
 # ═══════════════════════════════════════════════════════════════
-# SEND STATUS BACK TO GUI
+# SEND STATUS BACK TO ARDUINO / GUI
 # ═══════════════════════════════════════════════════════════════
-def send_status(status_id):
+def send_status(status_id: int):
     """
     Send a 2-byte response packet back to Arduino → GUI.
     Packet format matches clarq_rf_arduino.ino:
       byte 0: status_id
       byte 1: checksum (status_id XOR 0xAA)
+    Encoded as 4 hex chars inside AT+SEND.
     """
-    global _radio
-    if _radio is None:
+    global _lora
+    if _lora is None:
         return
-    try:
-        checksum = status_id ^ 0xAA
-        payload  = bytes([status_id, checksum])
 
-        # Use new pyrf24 API — pass TX address directly to stopListening()
-        _radio.stopListening(WRITE_PIPE)
-        time.sleep(0.01)
+    checksum    = status_id ^ 0xAA
+    hex_payload = f"{status_id:02X}{checksum:02X}"
+    at_cmd      = f"AT+SEND={LORA_DEST_ADDR},2,{hex_payload}"
 
+    with _lora_lock:
         for attempt in range(3):
-            ok = _radio.write(payload)
+            ok = _send_at(_lora, at_cmd, timeout=4.0)
             if ok:
-                print(f"[nRF] Status sent: id={status_id} ✓")
-                break
-            if attempt < 2:
-                time.sleep(0.01)
-        else:
-            print(f"[nRF] Status send failed: id={status_id}")
+                print(f"[LoRa] Status sent: id={status_id} ✓")
+                return
+            print(f"[LoRa] Send attempt {attempt+1} failed, retrying...")
+            time.sleep(0.1)
+        print(f"[LoRa] Status send failed after 3 attempts: id={status_id}")
 
-        time.sleep(0.01)
-        _radio.startListening()
+
+# ═══════════════════════════════════════════════════════════════
+# INCOMING PACKET PARSER
+# ═══════════════════════════════════════════════════════════════
+def parse_rcv(line: str) -> int | None:
+    """
+    Parse a +RCV line from the RYLR998.
+    Format:  +RCV=<src>,<len>,<hexdata>,<RSSI>,<SNR>
+    Returns cmd_id on success, None on any error.
+    """
+    if not line.startswith("+RCV="):
+        return None
+
+    try:
+        body = line[5:]                          # strip "+RCV="
+        parts = body.split(",")
+        if len(parts) < 5:
+            return None
+
+        # src=parts[0], length=parts[1], data=parts[2]
+        hex_data = parts[2]
+        rssi     = parts[3]
+        snr      = parts[4]
+
+        if len(hex_data) < 4:
+            print(f"[LoRa] Short payload: '{hex_data}'")
+            return None
+
+        cmd_id   = int(hex_data[0:2], 16)
+        checksum = int(hex_data[2:4], 16)
+
+        if checksum != (cmd_id ^ 0xAA):
+            print(f"[LoRa] Checksum fail — "
+                  f"got {checksum:#x} expected {cmd_id ^ 0xAA:#x}")
+            return None
+
+        if not 1 <= cmd_id <= 17:
+            print(f"[LoRa] Out-of-range cmd_id: {cmd_id}")
+            return None
+
+        print(f"[LoRa] RX  cmd={cmd_id}  RSSI={rssi} dBm  SNR={snr} dB")
+        return cmd_id
 
     except Exception as e:
-        print(f"[nRF] send_status error: {e}")
-        try:
-            _radio.startListening()
-        except:
-            pass
+        print(f"[LoRa] Parse error: {e}  raw='{line}'")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
-# HELPERS
+# HELPERS  (unchanged from nRF version)
 # ═══════════════════════════════════════════════════════════════
 def _run(label, cmd):
-    """Launch a shell command, return the Popen handle."""
     try:
         proc = subprocess.Popen(
             cmd, shell=True,
@@ -192,13 +249,11 @@ def _run(label, cmd):
 
 
 def _tmux_send(window, command):
-    """Send a command to a specific tmux window."""
     subprocess.run(
         ['tmux', 'send-keys', '-t', f'{TMUX_SESSION}:{window}', command, 'Enter'])
 
 
 def _tmux_running():
-    """Check if the drone tmux session is alive."""
     result = subprocess.run(
         f'tmux has-session -t {TMUX_SESSION} 2>/dev/null',
         shell=True)
@@ -235,40 +290,30 @@ def _stop_apriltag():
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMAND HANDLERS
+# COMMAND HANDLERS  (unchanged from nRF version)
 # ═══════════════════════════════════════════════════════════════
-
 def handle_ping():
-    """Confirms Jetson is alive."""
     print("  PING → sending PONG")
     send_status(STATUS_PONG)
 
 
 def handle_launch(sim=False):
-    """Runs launch_drone.sh to create the tmux session."""
     mode = "SIM" if sim else "REAL"
     print(f"  LAUNCH ({mode}) — running launch_drone.sh")
-
     if not os.path.exists(LAUNCH_SCRIPT):
         print(f"  ERROR: {LAUNCH_SCRIPT} not found!")
         return
-
     flag = "--sim" if sim else ""
     subprocess.Popen(f'bash "{LAUNCH_SCRIPT}" {flag}', shell=True)
-
     time.sleep(1)
-    status = STATUS_LAUNCHED_SIM if sim else STATUS_LAUNCHED
-    send_status(status)
+    send_status(STATUS_LAUNCHED_SIM if sim else STATUS_LAUNCHED)
 
 
 def handle_stop_all():
-    """Kills the tmux session and all CLARQ processes."""
     global _return_land_proc, _scan_proc, _fusion_proc, \
            _position_proc, _photo_proc, _video_proc
     print("  STOP ALL — killing drone tmux session + processes")
-
     _stop_apriltag()
-
     for proc, name in [
         (_return_land_proc, "return_land.py"),
         (_scan_proc,        "save_position.py"),
@@ -280,34 +325,18 @@ def handle_stop_all():
         if proc and proc.poll() is None:
             proc.terminate()
             print(f"  {name} stopped")
-
-    _return_land_proc = None
-    _scan_proc        = None
-    _fusion_proc      = None
-    _position_proc    = None
-    _photo_proc       = None
-    _video_proc       = None
-
-    subprocess.run(
-        f'tmux kill-session -t {TMUX_SESSION} 2>/dev/null',
-        shell=True)
+    _return_land_proc = _scan_proc = _fusion_proc = None
+    _position_proc    = _photo_proc = _video_proc = None
+    subprocess.run(f'tmux kill-session -t {TMUX_SESSION} 2>/dev/null', shell=True)
     print(f"  tmux session '{TMUX_SESSION}' killed")
-
     send_status(STATUS_ALL_STOPPED)
 
 
 def handle_set_home():
-    """
-    Writes a trigger file that set_origin.py watches for.
-    set_origin.py detects the file, saves current ZED pose
-    as origin_T0.json, then deletes the trigger file.
-    """
     print("  SET HOME — writing trigger file for set_origin.py")
-
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
-
     trigger = f'{ZED_NAV_DIR}/.set_home_trigger'
     try:
         with open(trigger, 'w') as f:
@@ -329,229 +358,121 @@ def handle_set_home():
 
 
 def handle_start_scan():
-    """
-    Sends save_position.py command to tmux window 3.
-    Legacy position-only tracking (no 3D reconstruction).
-    """
     print("  START SCAN — running save_position.py in tmux window 3")
-
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
-
     _tmux_send(3, f'{FULL_SETUP} && python3 "{SAVE_POSITION}"')
-    print("  save_position.py started in tmux window 3")
-
     time.sleep(2)
     send_status(STATUS_SCAN_STARTED)
 
 
 def handle_start_3d_fusion():
-    """
-    Starts ZED Fusion 3D reconstruction + position tracking.
-    Records to .SVO file and tracks drone position simultaneously.
-    """
     global _fusion_proc, _position_proc
-    print("  START 3D FUSION — launching ZED Fusion + position tracking")
-
+    print("  START 3D FUSION")
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
-
     os.makedirs(SCANS_DIR, exist_ok=True)
-
     if not os.path.exists(ZED_FUSION):
         print(f"  ERROR: {ZED_FUSION} not found!")
         return
-
-    print(f"  Starting ZED Fusion: {ZED_FUSION}")
-    _fusion_proc = _run("ZED Fusion", f'python3 "{ZED_FUSION}"')
-
+    _fusion_proc   = _run("ZED Fusion",         f'python3 "{ZED_FUSION}"')
     time.sleep(1)
-
-    print(f"  Starting position tracking: {SAVE_POSITION}")
-    _position_proc = _run(
-        "Position tracking",
-        f'bash -c "{FULL_SETUP} && python3 \\"{SAVE_POSITION}\\""'
-    )
-
+    _position_proc = _run("Position tracking",
+        f'bash -c "{FULL_SETUP} && python3 \\"{SAVE_POSITION}\\""')
     if _fusion_proc and _position_proc:
-        print("  ✓ 3D Fusion + position tracking active")
         send_status(STATUS_3D_FUSION_STARTED)
     else:
         print("  ERROR: Failed to start one or both processes")
 
 
 def handle_stop_3d_fusion():
-    """Stops ZED Fusion recording and position tracking."""
     global _fusion_proc, _position_proc
-    print("  STOP 3D FUSION — terminating processes")
-
+    print("  STOP 3D FUSION")
     stopped = False
-
-    if _fusion_proc and _fusion_proc.poll() is None:
-        print("  Stopping ZED Fusion...")
-        _fusion_proc.terminate()
-        _fusion_proc.wait(timeout=5)
-        _fusion_proc = None
-        stopped = True
-
-    if _position_proc and _position_proc.poll() is None:
-        print("  Stopping position tracking...")
-        _position_proc.terminate()
-        _position_proc.wait(timeout=5)
-        _position_proc = None
-        stopped = True
-
-    if stopped:
-        print("  ✓ 3D Fusion recording saved")
-    else:
+    for proc, name in [(_fusion_proc, "ZED Fusion"), (_position_proc, "Position tracking")]:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stopped = True
+            print(f"  {name} stopped")
+    _fusion_proc = _position_proc = None
+    if not stopped:
         print("  No fusion processes were running")
-
     send_status(STATUS_3D_FUSION_STOPPED)
 
 
 def handle_start_photo(quality="HIGH"):
-    """Starts photo capture at the specified quality setting."""
     global _photo_proc
     print(f"  START PHOTO CAPTURE — Quality: {quality}")
-
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
-
     os.makedirs(CAPTURES_DIR, exist_ok=True)
-
     if not os.path.exists(ZED_PHOTO):
         print(f"  ERROR: {ZED_PHOTO} not found!")
         return
-
-    _photo_proc = _run(
-        f"Photo capture ({quality})",
-        f'python3 "{ZED_PHOTO}" {quality}'
-    )
-
+    _photo_proc = _run(f"Photo capture ({quality})", f'python3 "{ZED_PHOTO}" {quality}')
     if _photo_proc:
-        print(f"  ✓ Photo capture active ({quality})")
         send_status(STATUS_PHOTO_STARTED)
-    else:
-        print("  ERROR: Failed to start photo capture")
 
 
 def handle_start_video(quality="HIGH"):
-    """Starts video recording at the specified quality setting."""
     global _video_proc
     print(f"  START VIDEO RECORDING — Quality: {quality}")
-
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
-
     os.makedirs(CAPTURES_DIR, exist_ok=True)
-
     if not os.path.exists(ZED_VIDEO):
         print(f"  ERROR: {ZED_VIDEO} not found!")
         return
-
-    _video_proc = _run(
-        f"Video recording ({quality})",
-        f'python3 "{ZED_VIDEO}" {quality}'
-    )
-
+    _video_proc = _run(f"Video recording ({quality})", f'python3 "{ZED_VIDEO}" {quality}')
     if _video_proc:
-        print(f"  ✓ Video recording active ({quality})")
         send_status(STATUS_VIDEO_STARTED)
-    else:
-        print("  ERROR: Failed to start video recording")
 
 
 def handle_stop_capture():
-    """Stops photo or video capture and saves files."""
     global _photo_proc, _video_proc
-    print("  STOP CAPTURE — terminating processes")
-
+    print("  STOP CAPTURE")
     stopped = False
-
-    if _photo_proc and _photo_proc.poll() is None:
-        print("  Stopping photo capture...")
-        _photo_proc.terminate()
-        _photo_proc.wait(timeout=5)
-        _photo_proc = None
-        stopped = True
-
-    if _video_proc and _video_proc.poll() is None:
-        print("  Stopping video recording...")
-        _video_proc.terminate()
-        _video_proc.wait(timeout=5)
-        _video_proc = None
-        stopped = True
-
-    if stopped:
-        print("  ✓ Capture stopped, files saved")
-    else:
+    for proc, name in [(_photo_proc, "photo capture"), (_video_proc, "video recording")]:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stopped = True
+            print(f"  {name} stopped")
+    _photo_proc = _video_proc = None
+    if not stopped:
         print("  No capture processes were running")
-
     send_status(STATUS_CAPTURE_STOPPED)
 
 
 def handle_set_gimbal(angle=0):
-    """
-    Sets gimbal pitch angle via serial to SimpleBGC controller.
-    Jetson → /dev/ttyACM2 → SimpleBGC → gimbal motor.
-    """
     print(f"  SET GIMBAL — Angle: {angle}°")
-
     try:
-        import serial
         import struct
-
         gimbal = serial.Serial(GIMBAL_PORT, GIMBAL_BAUD, timeout=1)
         time.sleep(0.1)
-
-        # CMD_CONTROL (id=67), Mode 2: absolute angle
         cmd_id = 67
-        mode   = 2
-        pitch  = int(angle / 0.02197265625)
-        data   = struct.pack('<Bhhhhhh', mode, 0, 0, 300, pitch, 0, 0)
-
-        size            = len(data)
-        header_checksum = (cmd_id + size) & 0xFF
-        body_checksum   = sum(data) & 0xFF
-        packet = (bytes([0x3E, cmd_id, size, header_checksum])
-                  + data + bytes([body_checksum]))
-
-        gimbal.write(packet)
-        time.sleep(0.5)
-
-        # Mode 0: release control (allows drift correction)
-        mode = 0
-        data = struct.pack('<Bhhhhhh', mode, 0, 0, 0, 0, 0, 0)
-        size            = len(data)
-        header_checksum = (cmd_id + size) & 0xFF
-        body_checksum   = sum(data) & 0xFF
-        packet = (bytes([0x3E, cmd_id, size, header_checksum])
-                  + data + bytes([body_checksum]))
-
-        gimbal.write(packet)
+        for mode, pitch_val in [(2, int(angle / 0.02197265625)), (0, 0)]:
+            data   = struct.pack('<Bhhhhhh', mode, 0, 0, 300 if mode == 2 else 0, pitch_val, 0, 0)
+            size   = len(data)
+            hchk   = (cmd_id + size) & 0xFF
+            bchk   = sum(data) & 0xFF
+            packet = bytes([0x3E, cmd_id, size, hchk]) + data + bytes([bchk])
+            gimbal.write(packet)
+            time.sleep(0.5)
         gimbal.close()
-
         print(f"  ✓ Gimbal set to {angle}°")
-        send_status(STATUS_GIMBAL_SET)
-
     except Exception as e:
         print(f"  ERROR: Gimbal control failed: {e}")
-        print(f"  Check that SimpleBGC is connected on {GIMBAL_PORT}")
-        send_status(STATUS_GIMBAL_SET)
+    send_status(STATUS_GIMBAL_SET)
 
 
 def handle_save_end():
-    """
-    Writes a trigger file that save_position.py watches for.
-    When detected, save_position.py snapshots the current
-    position as scan_end_pos.json and stops recording.
-    """
     print("  SAVE END — writing trigger file")
-
     def _snap():
         try:
             os.makedirs(os.path.dirname(TRIGGER_FILE), exist_ok=True)
@@ -562,32 +483,17 @@ def handle_save_end():
             send_status(STATUS_END_SAVED)
         except Exception as e:
             print(f"  SAVE END failed: {e}")
-
     threading.Thread(target=_snap, daemon=True).start()
 
 
 def handle_go_home():
-    """
-    Runs return_land.py in tmux window 4 and starts AprilTag.
-    Requires origin_T0.json to exist (SET HOME must have run first).
-
-    return_land.py phases:
-      Phase 1 — ZED navigate back to origin_T0 position
-      Phase 2 — AprilTag align at 90° above tag
-      Phase 3 — Land on rover
-    """
     print("  GO HOME — starting return_land.py + AprilTag")
-
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
-
     if not os.path.exists(ORIGIN_FILE):
-        print(f"  ERROR: {ORIGIN_FILE} not found!")
-        print("  Run SET HOME POINT first!")
+        print(f"  ERROR: {ORIGIN_FILE} not found — run SET HOME first!")
         return
-
-    # Start AprilTag in tmux window 1
     _tmux_send(1, (
         f'{FULL_SETUP} && ros2 run apriltag_ros apriltag_node --ros-args '
         f'-r image_rect:=/zed/zed_node/rgb/color/rect/image '
@@ -595,43 +501,29 @@ def handle_go_home():
         f'-r detections:=/detections '
         f'--params-file "{TAGS_CONFIG}"'
     ))
-    print("  AprilTag started in tmux window 1")
-
     time.sleep(2)
-
-    # Start return_land.py in tmux window 4
     _tmux_send(4, f'{FULL_SETUP} && python3 "{RETURN_LAND}"')
-    print("  return_land.py started in tmux window 4")
-
     send_status(STATUS_GOING_HOME)
 
 
 def handle_start_tag():
-    """Start AprilTag node standalone."""
     print("  START TAG")
     _start_apriltag()
 
 
 def handle_stop_tag():
-    """Stop AprilTag node."""
     print("  STOP TAG")
     _stop_apriltag()
 
 
 def handle_land():
-    """
-    Shortcut — starts AprilTag and return_land immediately.
-    Skips ZED Phase 1 navigation, goes straight to AprilTag alignment.
-    """
     global _return_land_proc
     print("  LAND — AprilTag + return_land.py")
     _start_apriltag()
     time.sleep(3)
-
     if not _tmux_running():
         print("  ERROR: tmux session not running!")
         return
-
     _tmux_send(4, f'{FULL_SETUP} && python3 "{RETURN_LAND}"')
     send_status(STATUS_LAND_ACK)
 
@@ -639,12 +531,11 @@ def handle_land():
 # ═══════════════════════════════════════════════════════════════
 # COMMAND DISPATCHER
 # ═══════════════════════════════════════════════════════════════
-def dispatch(cmd_id):
+def dispatch(cmd_id: int):
     print(f"\n{'='*44}")
     print(f"  COMMAND: {cmd_id}")
     print(f"{'='*44}")
 
-    # Run on main thread (fast, non-blocking)
     sync_map = {
         CMD_ID_PING:     handle_ping,
         CMD_ID_STOP_TAG: handle_stop_tag,
@@ -652,7 +543,6 @@ def dispatch(cmd_id):
         CMD_ID_SAVE_END: handle_save_end,
     }
 
-    # Run in background thread (may take time)
     thread_map = {
         CMD_ID_LAND:            handle_land,
         CMD_ID_START_TAG:       handle_start_tag,
@@ -669,60 +559,54 @@ def dispatch(cmd_id):
     }
 
     if cmd_id == CMD_ID_LAUNCH_SIM:
-        threading.Thread(
-            target=lambda: handle_launch(sim=True),
-            daemon=True).start()
+        threading.Thread(target=lambda: handle_launch(sim=True), daemon=True).start()
     elif cmd_id in sync_map:
         sync_map[cmd_id]()
     elif cmd_id in thread_map:
-        threading.Thread(
-            target=thread_map[cmd_id],
-            daemon=True).start()
+        threading.Thread(target=thread_map[cmd_id], daemon=True).start()
     else:
         print(f"  Unknown command ID: {cmd_id}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# NRF24 RECEIVE LOOP
+# LORA RECEIVE LOOP
 # ═══════════════════════════════════════════════════════════════
-def rf_listen_loop(radio):
+def lora_listen_loop(ser: serial.Serial):
     """
-    Main loop — polls NRF24L01 for incoming packets.
-    Packet format (2 bytes, matches clarq_rf_arduino.ino):
-      byte 0: cmd_id
-      byte 1: checksum (cmd_id XOR 0xAA)
+    Main loop — reads lines from RYLR998 UART.
+    Normal incoming lines:   +RCV=<src>,<len>,<hex>,<RSSI>,<SNR>
+    AT echo / status lines:  +OK, +ERR, +READY  (logged and ignored)
     """
-    print("[nRF] Listening for commands...")
+    print("[LoRa] Listening for commands...")
+    buf = ""
+
     while True:
         try:
-            if radio.available():
-                payload = radio.read(2)
+            # Grab whatever bytes are waiting
+            with _lora_lock:
+                chunk = ser.read(ser.in_waiting or 1).decode(errors="ignore")
 
-                if len(payload) < 2:
-                    print("[nRF] Short packet — ignored")
+            buf += chunk
+
+            # Process all complete lines in the buffer
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+
+                if not line:
                     continue
 
-                cmd_id   = payload[0]
-                checksum = payload[1]
-
-                # Validate checksum
-                if checksum != (cmd_id ^ 0xAA):
-                    print(f"[nRF] Checksum fail — "
-                          f"got {checksum:#x} "
-                          f"expected {cmd_id ^ 0xAA:#x}")
-                    continue
-
-                if not 1 <= cmd_id <= 17:
-                    print(f"[nRF] Out of range cmd_id: {cmd_id}")
-                    continue
-
-                dispatch(cmd_id)
-
-            else:
-                time.sleep(0.01)
+                if line.startswith("+RCV="):
+                    cmd_id = parse_rcv(line)
+                    if cmd_id is not None:
+                        dispatch(cmd_id)
+                elif line.startswith(("+OK", "+ERR", "+READY")):
+                    print(f"[LoRa] Module: {line}")
+                else:
+                    print(f"[LoRa] Unhandled: {line}")
 
         except Exception as e:
-            print(f"[nRF] Receive error: {e}")
+            print(f"[LoRa] Receive error: {e}")
             time.sleep(0.5)
 
 
@@ -732,21 +616,22 @@ def rf_listen_loop(radio):
 if __name__ == '__main__':
     print("=" * 44)
     print("  CLARQ Command Listener")
-    print("  Transport: NRF24L01")
+    print("  Transport: RYLR998 LoRa (868/915 MHz)")
+    print(f"  Port:      {LORA_PORT}  @  {LORA_BAUD} baud")
+    print(f"  Address:   {LORA_ADDRESS}  →  dest {LORA_DEST_ADDR}")
     print(f"  Base path: {BASE}")
-    print(f"  Gimbal port: {GIMBAL_PORT}")
+    print(f"  Gimbal:    {GIMBAL_PORT}")
     print("=" * 44)
 
-    if subprocess.run('which tmux', shell=True,
-                      capture_output=True).returncode != 0:
-        print("WARNING: tmux not found — install with: sudo apt install tmux")
+    if subprocess.run('which tmux', shell=True, capture_output=True).returncode != 0:
+        print("WARNING: tmux not found — sudo apt install tmux")
 
-    radio = init_radio()
+    lora = init_lora()
 
     try:
-        rf_listen_loop(radio)
+        lora_listen_loop(lora)
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
-        radio.powerDown()
-        print("Radio powered down.")
+        lora.close()
+        print("[LoRa] Port closed.")
