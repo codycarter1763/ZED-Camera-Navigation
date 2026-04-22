@@ -1,21 +1,30 @@
 /*
- * clarq_rf_arduino.ino - CLARQ RF Bridge (Arduino Nano)
- * CLEAN VERSION - Minimal debug output
+ * clarq_rf_arduino.ino - CLARQ RF Bridge (Arduino Uno)
+ * RYLR998 LoRa Module (868/915 MHz) via SoftwareSerial
+ * Baud rate lowered to 9600 for reliable SoftwareSerial on Uno
  */
 
-#include <SPI.h>
-#include <RF24.h>
+#include <SoftwareSerial.h>
+#include <Arduino.h>
+// ── RYLR998 UART Config ──────────────────────────────────────
+// D10 = RX (connect to RYLR998 TX)
+// D11 = TX (connect to RYLR998 RX)
+// Avoid D0/D1 — those are shared with USB Serial on the Uno
+#define LORA_RX_PIN 10
+#define LORA_TX_PIN 11
 
-// ── NRF24L01 Config ──────────────────────────────────────────
-#define CE_PIN  9
-#define CSN_PIN 10
+SoftwareSerial loraSerial(LORA_RX_PIN, LORA_TX_PIN);
 
-RF24 radio(CE_PIN, CSN_PIN);
-
-// Must match clarq_rf_listener.py exactly
-const uint8_t  RF_CHANNEL = 100;
-const uint64_t WRITE_PIPE = 0x5152414C43LL;  // "CLARQ" in hex
-const uint64_t READ_PIPE  = 0x304E53544ALL;  // "JTSN0" in hex
+// RYLR998 AT settings — must match receiver side exactly
+#define LORA_NETWORK_ID   18
+#define LORA_ADDRESS      10          // This node (Arduino)
+#define LORA_DEST_ADDR    11          // Remote node (Jetson)
+#define LORA_BAND         915000000   // Hz — use 868000000 for EU
+#define LORA_SF           9
+#define LORA_BANDWIDTH    7
+#define LORA_CR           1
+#define LORA_PREAMBLE     4
+#define LORA_POWER        22
 
 // ── Command IDs ──────────────────────────────────────────────
 #define CMD_ID_PING            1
@@ -36,35 +45,80 @@ const uint64_t READ_PIPE  = 0x304E53544ALL;  // "JTSN0" in hex
 #define CMD_ID_STOP_CAPTURE    16
 #define CMD_ID_SET_GIMBAL      17
 
+// ── AT Command Helper ────────────────────────────────────────
+// Sends an AT command and blocks until +OK, +ERR, or timeout.
+// Returns true on +OK.
+bool sendAT(const String& cmd, unsigned long timeoutMs = 3000) {
+  // Flush any stale bytes before sending
+  while (loraSerial.available()) loraSerial.read();
+
+  loraSerial.println(cmd);
+
+  unsigned long start = millis();
+  String resp = "";
+
+  while (millis() - start < timeoutMs) {
+    while (loraSerial.available()) {
+      resp += (char)loraSerial.read();
+    }
+    if (resp.indexOf("+OK")  >= 0) return true;
+    if (resp.indexOf("+ERR") >= 0) return false;
+  }
+  return false;  // Timeout
+}
+
+// ── LoRa Transmit ────────────────────────────────────────────
+// Encodes 2-byte payload as hex and sends via AT+SEND
+bool loraSend(uint8_t cmd_id) {
+  uint8_t checksum = cmd_id ^ 0xAA;
+
+  char hexPayload[5];
+  snprintf(hexPayload, sizeof(hexPayload), "%02X%02X", cmd_id, checksum);
+
+  String atCmd = "AT+SEND=";
+  atCmd += LORA_DEST_ADDR;
+  atCmd += ",2,";
+  atCmd += hexPayload;
+
+  return sendAT(atCmd, 4000);  // Slightly longer timeout at 9600 baud
+}
+
+// ── LoRa Init ────────────────────────────────────────────────
+void initLora() {
+  loraSerial.begin(9600);  // 9600 is reliable on Uno SoftwareSerial
+  delay(1000);             // Give module time to boot
+
+  // Reset and re-configure
+  sendAT("AT+RESET");
+  delay(1500);             // Wait for module to come back after reset
+
+  sendAT("AT+ADDRESS="   + String(LORA_ADDRESS));
+  sendAT("AT+NETWORKID=" + String(LORA_NETWORK_ID));
+  sendAT("AT+BAND="      + String(LORA_BAND));
+
+  String param = "AT+PARAMETER=";
+  param += LORA_SF;        param += ",";
+  param += LORA_BANDWIDTH; param += ",";
+  param += LORA_CR;        param += ",";
+  param += LORA_PREAMBLE;
+  sendAT(param);
+
+  sendAT("AT+CRFOP=" + String(LORA_POWER));
+
+  // Set module baud to 9600 (in case it was previously set differently)
+  // AT+IPR=<baud> — persists across resets
+  sendAT("AT+IPR=9600");
+}
+
 // ── Setup ────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  
-  // Wait for serial and USB to stabilize
+  Serial.begin(115200);  // USB Serial to GUI — Uno hardware UART is fine here
   delay(2000);
-  
-  // Clear any garbage in serial buffer
-  while(Serial.available()) {
-    Serial.read();
-  }
-  
-  // Initialize NRF24L01
-  radio.begin();
-  radio.setChannel(RF_CHANNEL);
-  radio.setPALevel(RF24_PA_MAX);
-  radio.setDataRate(RF24_250KBPS);
-  radio.setCRCLength(RF24_CRC_16);
-  radio.setAutoAck(true);
-  radio.setRetries(5, 15);
-  
-  // Open pipes
-  radio.openWritingPipe(WRITE_PIPE);
-  radio.openReadingPipe(1, READ_PIPE);
-  
-  // Start listening
-  radio.startListening();
-  
-  // Send ready signal to GUI (ONLY THIS, NOTHING ELSE)
+
+  while (Serial.available()) Serial.read();  // Clear garbage
+
+  initLora();
+
   Serial.println("CLARQ_RF_READY");
 }
 
@@ -72,32 +126,14 @@ void setup() {
 void handleSerialCommand() {
   String line = Serial.readStringUntil('\n');
   line.trim();
-  
-  // Expected format: "CMD:<id>"
-  if (!line.startsWith("CMD:")) {
-    return;  // Silently ignore invalid format
-  }
-  
-  // Extract command ID
+
+  if (!line.startsWith("CMD:")) return;
+
   int cmd_id = line.substring(4).toInt();
-  
-  // Validate command ID
-  if (cmd_id < 1 || cmd_id > 17) {
-    return;  // Silently ignore invalid ID
-  }
-  
-  // Build packet: [cmd_id, checksum]
-  uint8_t packet[2];
-  packet[0] = cmd_id;
-  packet[1] = cmd_id ^ 0xAA;  // Simple XOR checksum
-  
-  // Send to Jetson via nRF
-  radio.stopListening();
-  delay(1);  // Allow radio time to settle before transmitting
-  bool ok = radio.write(packet, 2);
-  radio.startListening();
-  
-  // Report to GUI
+  if (cmd_id < 1 || cmd_id > 17) return;
+
+  bool ok = loraSend((uint8_t)cmd_id);
+
   if (ok) {
     Serial.print("TX_OK:");
     Serial.println(cmd_id);
@@ -107,37 +143,44 @@ void handleSerialCommand() {
   }
 }
 
-// ── Handle Responses from Jetson ────────────────────────────
-void handleRadioResponse() {
-  uint8_t packet[2];
-  
-  // Read the data
-  radio.read(packet, 2);
-  
-  uint8_t status_id = packet[0];
-  uint8_t checksum  = packet[1];
-  
-  // Validate checksum
-  if (checksum != (status_id ^ 0xAA)) {
-    return;  // Silently ignore bad checksum
-  }
-  
-  // Forward to GUI
+// ── Handle Incoming LoRa Packets from Jetson ─────────────────
+// RYLR998 unsolicited receive format:
+//   +RCV=<addr>,<len>,<data>,<RSSI>,<SNR>\r\n
+void handleLoraResponse() {
+  String line = loraSerial.readStringUntil('\n');
+  line.trim();
+
+  if (!line.startsWith("+RCV=")) return;
+
+  // +RCV=<src>,<len>,<data>,<RSSI>,<SNR>
+  int c1 = line.indexOf(',');
+  int c2 = line.indexOf(',', c1 + 1);
+  int c3 = line.indexOf(',', c2 + 1);
+  if (c1 < 0 || c2 < 0 || c3 < 0) return;
+
+  String hexData = line.substring(c2 + 1, c3);
+  if (hexData.length() < 4) return;
+
+  uint8_t status_id = (uint8_t)strtol(hexData.substring(0, 2).c_str(), nullptr, 16);
+  uint8_t checksum  = (uint8_t)strtol(hexData.substring(2, 4).c_str(), nullptr, 16);
+
+  if (checksum != (status_id ^ 0xAA)) return;  // Bad checksum, silently drop
+
   Serial.print("RX:");
   Serial.println(status_id);
 }
 
 // ── Main Loop ────────────────────────────────────────────────
 void loop() {
-  // Check for commands from GUI (USB Serial)
+  // SoftwareSerial can't receive while transmitting, so check LoRa first
+  // when not actively sending a command.
+  if (loraSerial.available()) {
+    handleLoraResponse();
+  }
+
   if (Serial.available()) {
     handleSerialCommand();
   }
-  
-  // Check for responses from Jetson (nRF)
-  if (radio.available()) {
-    handleRadioResponse();
-  }
-  
+
   delay(10);
 }
