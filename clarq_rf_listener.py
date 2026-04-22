@@ -119,7 +119,10 @@ def init_radio():
     radio.setDataRate(RF24_250KBPS)
     radio.setCRCLength(RF24_CRC_16)
     radio.openReadingPipe(1, READ_PIPE)
-    radio.openWritingPipe(WRITE_PIPE)
+
+    # Use new pyrf24 API — pass TX address directly to stopListening()
+    # Replaces the deprecated openWritingPipe() call
+    radio.stopListening(WRITE_PIPE)
     radio.startListening()
 
     _radio = radio
@@ -144,7 +147,8 @@ def send_status(status_id):
         checksum = status_id ^ 0xAA
         payload  = bytes([status_id, checksum])
 
-        _radio.stopListening()
+        # Use new pyrf24 API — pass TX address directly to stopListening()
+        _radio.stopListening(WRITE_PIPE)
         time.sleep(0.01)
 
         for attempt in range(3):
