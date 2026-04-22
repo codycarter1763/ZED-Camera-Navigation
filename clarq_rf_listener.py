@@ -19,7 +19,7 @@ READ_PIPE   = b"CLARQ"   # Arduino → Jetson (commands in)
 WRITE_PIPE  = b"JTSN0"   # Jetson → Arduino (ACK/status out)
 
 CE_PIN  = 18             # BCM GPIO pin
-SPI_BUS = 1              # SPI bus (0 or 1 depending on Jetson)
+SPI_BUS = 0              # SPI bus (0 or 1 depending on Jetson)
 SPI_DEV = 0              # SPI device (CS)
 
 # ── Command IDs ───────────────────────────────────────────────
