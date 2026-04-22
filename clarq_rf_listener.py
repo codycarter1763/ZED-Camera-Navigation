@@ -118,6 +118,8 @@ def init_radio():
     radio.setPALevel(RF24_PA_MAX)
     radio.setDataRate(RF24_250KBPS)
     radio.setCRCLength(RF24_CRC_16)
+    radio.setAutoAck(True)
+    radio.setRetries(5, 15)
     radio.openReadingPipe(1, READ_PIPE)
 
     # Use new pyrf24 API — pass TX address directly to stopListening()
