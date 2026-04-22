@@ -34,6 +34,7 @@ const uint64_t READ_PIPE  = 0x304E53544ALL;  // "JTSN0" in hex
 #define CMD_ID_START_PHOTO     14
 #define CMD_ID_START_VIDEO     15
 #define CMD_ID_STOP_CAPTURE    16
+#define CMD_ID_SET_GIMBAL      17
 
 // ── Setup ────────────────────────────────────────────────────
 void setup() {
@@ -67,9 +68,7 @@ void setup() {
   Serial.println("CLARQ_RF_READY");
 }
 
-
-
-// ── Handle Commands from GUI ────────────────────────────────
+// ── Handle Commands from GUI ─────────────────────────────────
 void handleSerialCommand() {
   String line = Serial.readStringUntil('\n');
   line.trim();
@@ -83,7 +82,7 @@ void handleSerialCommand() {
   int cmd_id = line.substring(4).toInt();
   
   // Validate command ID
-  if (cmd_id < 1 || cmd_id > 16) {
+  if (cmd_id < 1 || cmd_id > 17) {
     return;  // Silently ignore invalid ID
   }
   
