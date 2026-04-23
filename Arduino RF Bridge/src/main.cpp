@@ -6,8 +6,15 @@
 
 HardwareSerial loraSerial(1);
 
-#define LORA_ADDRESS   10
-#define LORA_DEST_ADDR 11
+#define LORA_NETWORK_ID   18
+#define LORA_ADDRESS      10
+#define LORA_DEST_ADDR    11
+#define LORA_BAND         915000000
+#define LORA_SF           9
+#define LORA_BANDWIDTH    7
+#define LORA_CR           1
+#define LORA_PREAMBLE     12
+#define LORA_POWER        22
 
 #define CMD_ID_PING            1
 #define CMD_ID_LAND            2
@@ -27,54 +34,71 @@ HardwareSerial loraSerial(1);
 #define CMD_ID_STOP_CAPTURE    16
 #define CMD_ID_SET_GIMBAL      17
 
-// ── Send plain text command ───────────────────────────────────
-bool loraSend(uint8_t cmd_id) {
-  // Format: AT+SEND=<dest>,<len>,<data>
-  // Data is just the command number as a string e.g. "8"
-  String data   = String(cmd_id);
-  String atCmd  = "AT+SEND=" + String(LORA_DEST_ADDR) + "," + String(data.length()) + "," + data;
+bool sendAT(const String& cmd, unsigned long timeoutMs = 3000) {
+  while (loraSerial.available()) loraSerial.read();
+  loraSerial.println(cmd);
 
-  loraSerial.println(atCmd);
-
-  // Wait for +OK or +ERR
   unsigned long start = millis();
   String resp = "";
-  while (millis() - start < 4000) {
+
+  while (millis() - start < timeoutMs) {
     while (loraSerial.available()) {
       resp += (char)loraSerial.read();
     }
-    if (resp.indexOf("+OK")  >= 0) return true;
-    if (resp.indexOf("+ERR") >= 0) return false;
+    if (resp.indexOf("+OK")    >= 0) return true;
+    if (resp.indexOf("+READY") >= 0) return true;
+    if (resp.indexOf("+ERR")   >= 0) return false;
   }
+  Serial.print("[LoRa] No response to: ");
+  Serial.print(cmd);
+  Serial.print(" | raw: ");
+  Serial.println(resp);
   return false;
 }
 
-// ── Handle incoming from Jetson ───────────────────────────────
-// +RCV=<addr>,<len>,<data>,<RSSI>,<SNR>
-void handleLoraResponse() {
-  String line = loraSerial.readStringUntil('\n');
-  line.trim();
+bool loraSend(uint8_t cmd_id) {
+  uint8_t checksum = cmd_id ^ 0xAA;
+  char hexPayload[5];
+  snprintf(hexPayload, sizeof(hexPayload), "%02X%02X", cmd_id, checksum);
 
-  if (!line.startsWith("+RCV=")) return;
+  String atCmd = "AT+SEND=";
+  atCmd += LORA_DEST_ADDR;
+  atCmd += ",4,";          // 4 ASCII chars
+  atCmd += hexPayload;
 
-  // Extract data field
-  int c1 = line.indexOf(',');
-  int c2 = line.indexOf(',', c1 + 1);
-  int c3 = line.indexOf(',', c2 + 1);
-  if (c1 < 0 || c2 < 0 || c3 < 0) return;
-
-  String data = line.substring(c2 + 1, c3);
-  data.trim();
-
-  // Data is just the status id as plain text e.g. "8"
-  int status_id = data.toInt();
-  if (status_id < 1 || status_id > 17) return;
-
-  Serial.print("RX:");
-  Serial.println(status_id);
+  return sendAT(atCmd, 4000);
 }
 
-// ── Handle commands from GUI ──────────────────────────────────
+void initLora() {
+  loraSerial.begin(115200, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+  delay(1000);
+
+  bool alive = sendAT("AT", 2000);
+  if (!alive) {
+    Serial.println("[LoRa] WARN: module not responding");
+    Serial.println("CLARQ_RF_READY");
+    return;
+  }
+  Serial.println("[LoRa] Module alive ✓");
+
+  sendAT("AT+ADDRESS="   + String(LORA_ADDRESS),    1000);
+  sendAT("AT+NETWORKID=" + String(LORA_NETWORK_ID), 1000);
+  sendAT("AT+BAND="      + String(LORA_BAND),       2000);
+  delay(500);
+
+  String param = "AT+PARAMETER=";
+  param += LORA_SF;        param += ",";
+  param += LORA_BANDWIDTH; param += ",";
+  param += LORA_CR;        param += ",";
+  param += LORA_PREAMBLE;
+  sendAT(param, 2000);
+  delay(500);
+
+  sendAT("AT+CRFOP=" + String(LORA_POWER), 1000);
+  Serial.println("[LoRa] Configured ✓");
+  Serial.println("CLARQ_RF_READY");
+}
+
 void handleSerialCommand() {
   String line = Serial.readStringUntil('\n');
   line.trim();
@@ -95,20 +119,34 @@ void handleSerialCommand() {
   }
 }
 
+void handleLoraResponse() {
+  String line = loraSerial.readStringUntil('\n');
+  line.trim();
+
+  if (!line.startsWith("+RCV=")) return;
+
+  int c1 = line.indexOf(',');
+  int c2 = line.indexOf(',', c1 + 1);
+  int c3 = line.indexOf(',', c2 + 1);
+  if (c1 < 0 || c2 < 0 || c3 < 0) return;
+
+  String hexData = line.substring(c2 + 1, c3);
+  if (hexData.length() < 4) return;
+
+  uint8_t status_id = (uint8_t)strtol(hexData.substring(0, 2).c_str(), nullptr, 16);
+  uint8_t checksum  = (uint8_t)strtol(hexData.substring(2, 4).c_str(), nullptr, 16);
+
+  if (checksum != (status_id ^ 0xAA)) return;
+
+  Serial.print("RX:");
+  Serial.println(status_id);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2000);
   while (Serial.available()) Serial.read();
-
-  loraSerial.begin(115200, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
-  delay(1000);
-
-  // Basic init — no reset, just set address
-  loraSerial.println("AT");                              delay(500);
-  loraSerial.println("AT+ADDRESS=" + String(LORA_ADDRESS)); delay(500);
-  while (loraSerial.available()) loraSerial.read();      // flush responses
-
-  Serial.println("CLARQ_RF_READY");
+  initLora();
 }
 
 void loop() {
