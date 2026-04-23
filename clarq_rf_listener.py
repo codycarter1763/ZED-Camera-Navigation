@@ -110,24 +110,19 @@ _lora_lock = threading.Lock()   # Serialize AT commands (TX blocks RX)
 # RYLR998 INIT
 # ═══════════════════════════════════════════════════════════════
 def _send_at(ser: serial.Serial, cmd: str, timeout: float = 3.0) -> bool:
-    """
-    Send a single AT command and wait for +OK or +ERR.
-    Caller must hold _lora_lock.
-    """
-    # Flush stale bytes
     ser.reset_input_buffer()
-
     ser.write((cmd + "\r\n").encode())
-
+    
     deadline = time.time() + timeout
     resp = ""
     while time.time() < deadline:
+        time.sleep(0.05)
         if ser.in_waiting:
             resp += ser.read(ser.in_waiting).decode(errors="ignore")
-        if "+OK"  in resp: return True
-        if "+ERR" in resp: return False
-        time.sleep(0.05)
-    return False  # Timeout
+        if "+OK"    in resp: return True
+        if "+READY" in resp: return True  # normal response to AT+RESET
+        if "+ERR"   in resp: return False
+    return False
 
 
 def init_lora() -> serial.Serial:
@@ -135,7 +130,17 @@ def init_lora() -> serial.Serial:
     print("[LoRa] Initialising RYLR998...")
 
     ser = serial.Serial(LORA_PORT, 115200, timeout=1)
-    time.sleep(0.5)
+    time.sleep(1.0)  # let module boot
+
+    # Ping first — if this fails, something is wrong with wiring/baud
+    ok = _send_at(ser, "AT", timeout=2.0)
+    print(f"[LoRa] Initial ping: {'✓' if ok else 'FAIL — check wiring'}")
+
+    if not ok:
+        print("[LoRa] Cannot communicate with module — stopping here")
+        print(f"[LoRa] Check: correct port? TX/RX crossed? Module powered?")
+        ser.close()
+        sys.exit(1)
 
     cmds = [
         ("AT+RESET",    2.0),
