@@ -168,9 +168,9 @@ def send_status(status_id: int):
     if _lora is None:
         return
 
-    checksum    = status_id ^ 0xAA
-    hex_payload = f"{status_id:02X}{checksum:02X}"
-    at_cmd      = f"AT+SEND={LORA_DEST_ADDR},2,{hex_payload}"
+    # Plain text — just the number e.g. "8"
+    data   = str(status_id)
+    at_cmd = f"AT+SEND={LORA_DEST_ADDR},{len(data)},{data}"
 
     with _lora_lock:
         for attempt in range(3):
@@ -183,37 +183,31 @@ def send_status(status_id: int):
         print(f"[LoRa] Status send failed after 3 attempts: id={status_id}")
 
 
-# ═══════════════════════════════════════════════════════════════
-# INCOMING PACKET PARSER
-# ═══════════════════════════════════════════════════════════════
 def parse_rcv(line: str) -> int | None:
     if not line.startswith("+RCV="):
         return None
     try:
-        parts    = line[5:].split(",")
+        parts = line[5:].split(",")
         if len(parts) < 5:
             return None
-        hex_data = parts[2]
-        rssi     = parts[3]
-        snr      = parts[4]
-        if len(hex_data) < 4:
-            print(f"[LoRa] Short payload: '{hex_data}'")
-            return None
-        cmd_id   = int(hex_data[0:2], 16)
-        checksum = int(hex_data[2:4], 16)
-        if checksum != (cmd_id ^ 0xAA):
-            print(f"[LoRa] Checksum fail — got {checksum:#x} expected {cmd_id ^ 0xAA:#x}")
-            return None
+
+        # Plain text data field — just the command number
+        data = parts[2].strip()
+        rssi = parts[3]
+        snr  = parts[4]
+
+        cmd_id = int(data)
+
         if not 1 <= cmd_id <= 17:
             print(f"[LoRa] Out-of-range cmd_id: {cmd_id}")
             return None
+
         print(f"[LoRa] RX  cmd={cmd_id}  RSSI={rssi} dBm  SNR={snr} dB")
         return cmd_id
+
     except Exception as e:
         print(f"[LoRa] Parse error: {e}  raw='{line}'")
         return None
-
-
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
