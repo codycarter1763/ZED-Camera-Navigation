@@ -1,13 +1,11 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 
-// ── RYLR998 UART Config ──────────────────────────────────────
-#define LORA_RX_PIN 19   
-#define LORA_TX_PIN 18   
+#define LORA_RX_PIN 19
+#define LORA_TX_PIN 18
 
 HardwareSerial loraSerial(1);
 
-// ── RYLR998 AT settings ──────────────────────────────────────
 #define LORA_NETWORK_ID   18
 #define LORA_ADDRESS      10
 #define LORA_DEST_ADDR    11
@@ -18,7 +16,6 @@ HardwareSerial loraSerial(1);
 #define LORA_PREAMBLE     4
 #define LORA_POWER        22
 
-// ── Command IDs ──────────────────────────────────────────────
 #define CMD_ID_PING            1
 #define CMD_ID_LAND            2
 #define CMD_ID_START_TAG       3
@@ -37,7 +34,6 @@ HardwareSerial loraSerial(1);
 #define CMD_ID_STOP_CAPTURE    16
 #define CMD_ID_SET_GIMBAL      17
 
-// ── AT Command Helper ────────────────────────────────────────
 bool sendAT(const String& cmd, unsigned long timeoutMs = 3000) {
   while (loraSerial.available()) loraSerial.read();
   loraSerial.println(cmd);
@@ -60,7 +56,6 @@ bool sendAT(const String& cmd, unsigned long timeoutMs = 3000) {
   return false;
 }
 
-// ── LoRa Transmit ────────────────────────────────────────────
 bool loraSend(uint8_t cmd_id) {
   uint8_t checksum = cmd_id ^ 0xAA;
   char hexPayload[5];
@@ -74,53 +69,36 @@ bool loraSend(uint8_t cmd_id) {
   return sendAT(atCmd, 4000);
 }
 
-// ── LoRa Init ────────────────────────────────────────────────
 void initLora() {
   loraSerial.begin(115200, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
   delay(1000);
 
-  // First ping
   bool alive = sendAT("AT", 2000);
   if (!alive) {
     Serial.println("[LoRa] WARN: module not responding on first ping");
-    Serial.println("[LoRa] Check wiring: TX→GPIO15, RX→GPIO17, VDD→3.3V");
     Serial.println("CLARQ_RF_READY");
     return;
   }
   Serial.println("[LoRa] Module alive ✓");
 
-  // Reset and wait for module to reboot
-  sendAT("AT+RESET", 3000);
-  delay(2000);
-
-  // Re-ping after reset
-  bool alive2 = sendAT("AT", 2000);
-  if (!alive2) {
-    Serial.println("[LoRa] WARN: module lost after reset");
-    Serial.println("CLARQ_RF_READY");
-    return;
-  }
-  Serial.println("[LoRa] Post-reset ping ✓");
-
-  // Configure
-  sendAT("AT+ADDRESS="   + String(LORA_ADDRESS));
-  sendAT("AT+NETWORKID=" + String(LORA_NETWORK_ID));
-  sendAT("AT+BAND="      + String(LORA_BAND));
+  sendAT("AT+ADDRESS="   + String(LORA_ADDRESS),    1000);
+  sendAT("AT+NETWORKID=" + String(LORA_NETWORK_ID), 1000);
+  sendAT("AT+BAND="      + String(LORA_BAND),       2000);
+  delay(500);
 
   String param = "AT+PARAMETER=";
   param += LORA_SF;        param += ",";
   param += LORA_BANDWIDTH; param += ",";
   param += LORA_CR;        param += ",";
   param += LORA_PREAMBLE;
-  sendAT(param);
+  sendAT(param, 2000);
+  delay(500);
 
-  sendAT("AT+CRFOP=" + String(LORA_POWER));
+  sendAT("AT+CRFOP=" + String(LORA_POWER), 1000);
   Serial.println("[LoRa] Configured ✓");
-
   Serial.println("CLARQ_RF_READY");
 }
 
-// ── Handle Commands from GUI ─────────────────────────────────
 void handleSerialCommand() {
   String line = Serial.readStringUntil('\n');
   line.trim();
@@ -141,7 +119,6 @@ void handleSerialCommand() {
   }
 }
 
-// ── Handle Incoming LoRa Packets from Jetson ─────────────────
 void handleLoraResponse() {
   String line = loraSerial.readStringUntil('\n');
   line.trim();
@@ -165,7 +142,6 @@ void handleLoraResponse() {
   Serial.println(status_id);
 }
 
-// ── Setup ────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(2000);
@@ -173,7 +149,6 @@ void setup() {
   initLora();
 }
 
-// ── Main Loop ────────────────────────────────────────────────
 void loop() {
   if (loraSerial.available()) {
     handleLoraResponse();
