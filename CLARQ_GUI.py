@@ -702,7 +702,7 @@ class DroneGUI:
 
                 # Wait for CLARQ_RF_READY handshake from Arduino
                 self.log("Waiting for Arduino ready signal...", "dim")
-                deadline = time.time() + 5
+                deadline = time.time() + 10
                 ready = False
                 while time.time() < deadline:
                     if self.ser.in_waiting:
