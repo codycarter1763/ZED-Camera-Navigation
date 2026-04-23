@@ -223,11 +223,15 @@ def parse_rcv(line: str) -> int | None:
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 def _run(label, cmd):
+    """
+    Launch a background process.
+    Don't capture stdout/stderr so scripts can run normally.
+    """
     try:
         proc = subprocess.Popen(
             cmd, shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
+            stdout=None,  # Don't capture - let output go to terminal/journal
+            stderr=None)
         print(f"  {label} started (pid {proc.pid})")
         return proc
     except Exception as e:
@@ -355,42 +359,90 @@ def handle_start_scan():
 
 
 def handle_start_3d_fusion():
+    """
+    Button: START 3D FUSION
+    Stops ZED ROS2 wrapper, then starts ZED Fusion + position tracking.
+    Note: ZED Fusion needs direct camera access for spatial mapping.
+    """
     global _fusion_proc, _position_proc
     print("  START 3D FUSION")
     if not _tmux_running():
         print("  ERROR: tmux session not running — launch first!")
         return
+    
+    # Stop ZED ROS2 wrapper to free the camera
+    print("  Stopping ZED ROS2 wrapper...")
+    _tmux_send(0, "C-c")  # Send Ctrl+C to window 0
+    time.sleep(3)  # Wait for ZED to fully close
+    
     os.makedirs(SCANS_DIR, exist_ok=True)
     if not os.path.exists(ZED_FUSION):
         print(f"  ERROR: {ZED_FUSION} not found!")
         return
-    _fusion_proc   = _run("ZED Fusion", f'python3 "{ZED_FUSION}"')
+    
+    print("  Starting ZED Fusion scan...")
+    _fusion_proc = _run("ZED Fusion", f'python3 "{ZED_FUSION}"')
     time.sleep(1)
+    
+    print("  Starting position tracking...")
     _position_proc = _run("Position tracking",
         f'bash -c "{FULL_SETUP} && python3 \\"{SAVE_POSITION}\\""')
+    
     if _fusion_proc and _position_proc:
+        print("  ✓ 3D Fusion started")
         send_status(STATUS_3D_FUSION_STARTED)
     else:
         print("  ERROR: Failed to start one or both processes")
 
 
 def handle_stop_3d_fusion():
+    """
+    Button: STOP 3D FUSION
+    Stops ZED Fusion + position tracking, then restarts ZED ROS2 wrapper.
+    """
     global _fusion_proc, _position_proc
     print("  STOP 3D FUSION")
     stopped = False
+    
+    # Try graceful termination first
     for proc, name in [(_fusion_proc, "ZED Fusion"), (_position_proc, "Position tracking")]:
         if proc and proc.poll() is None:
+            print(f"  Stopping {name}...")
             proc.terminate()
-            proc.wait(timeout=5)
-            stopped = True
-            print(f"  {name} stopped")
+            try:
+                proc.wait(timeout=2)
+                stopped = True
+                print(f"  {name} stopped")
+            except subprocess.TimeoutExpired:
+                print(f"  {name} didn't stop gracefully, force killing...")
+                proc.kill()
+                stopped = True
+    
+    # Also use pkill as backup to catch any stragglers
+    subprocess.run("pkill -f zed_fusion_scan", shell=True)
+    subprocess.run("pkill -f save_position", shell=True)
+    
     _fusion_proc = _position_proc = None
+    
     if not stopped:
         print("  No fusion processes were running")
+    
+    # Restart ZED ROS2 wrapper
+    print("  Restarting ZED ROS2 wrapper...")
+    time.sleep(1)
+    _tmux_send(0, f'{FULL_SETUP} && ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2i')
+    time.sleep(3)
+    
+    print("  ✓ 3D Fusion stopped, ZED ROS2 wrapper restarted")
     send_status(STATUS_3D_FUSION_STOPPED)
 
 
 def handle_start_photo(quality="HIGH"):
+    """
+    Button: START PHOTO
+    Starts photo capture from running ZED ROS2 topics.
+    Uses /zed/zed_node/rgb/image_rect_color topic.
+    """
     global _photo_proc
     print(f"  START PHOTO CAPTURE — Quality: {quality}")
     if not _tmux_running():
@@ -400,12 +452,26 @@ def handle_start_photo(quality="HIGH"):
     if not os.path.exists(ZED_PHOTO):
         print(f"  ERROR: {ZED_PHOTO} not found!")
         return
-    _photo_proc = _run(f"Photo capture ({quality})", f'python3 "{ZED_PHOTO}" {quality}')
+    
+    # Launch with ROS2 environment
+    print("  Starting photo capture (ROS2)...")
+    _photo_proc = _run(
+        f"Photo capture ({quality})",
+        f'bash -c "{FULL_SETUP} && python3 \\"{ZED_PHOTO}\\" {quality}"')
+    
     if _photo_proc:
+        print("  ✓ Photo capture started")
         send_status(STATUS_PHOTO_STARTED)
+    else:
+        print("  ERROR: Failed to start photo capture")
 
 
 def handle_start_video(quality="HIGH"):
+    """
+    Button: START VIDEO
+    Starts video recording from running ZED ROS2 topics.
+    Uses /zed/zed_node/rgb/image_rect_color topic.
+    """
     global _video_proc
     print(f"  START VIDEO RECORDING — Quality: {quality}")
     if not _tmux_running():
@@ -415,24 +481,78 @@ def handle_start_video(quality="HIGH"):
     if not os.path.exists(ZED_VIDEO):
         print(f"  ERROR: {ZED_VIDEO} not found!")
         return
-    _video_proc = _run(f"Video recording ({quality})", f'python3 "{ZED_VIDEO}" {quality}')
+    
+    # Launch with ROS2 environment
+    print("  Starting video recording (ROS2)...")
+    _video_proc = _run(
+        f"Video recording ({quality})",
+        f'bash -c "{FULL_SETUP} && python3 \\"{ZED_VIDEO}\\" {quality}"')
+    
     if _video_proc:
+        print("  ✓ Video recording started")
         send_status(STATUS_VIDEO_STARTED)
+    else:
+        print("  ERROR: Failed to start video recording")
 
 
 def handle_stop_capture():
+    """
+    Button: STOP CAPTURE
+    Stops photo or video capture, then force-releases the ZED camera
+    at the OS/USB level so the next capture can reopen it cleanly.
+    """
     global _photo_proc, _video_proc
     print("  STOP CAPTURE")
     stopped = False
+
+    # Step 1 — graceful terminate via proc handle
     for proc, name in [(_photo_proc, "photo capture"), (_video_proc, "video recording")]:
         if proc and proc.poll() is None:
+            print(f"  Stopping {name}...")
             proc.terminate()
-            proc.wait(timeout=5)
-            stopped = True
-            print(f"  {name} stopped")
+            try:
+                proc.wait(timeout=2)
+                stopped = True
+                print(f"  {name} stopped")
+            except subprocess.TimeoutExpired:
+                print(f"  {name} didn't stop gracefully, force killing...")
+                proc.kill()
+                stopped = True
+
+    # Step 2 — pkill any stragglers by script name
+    subprocess.run("pkill -f zed_photo_capture", shell=True)
+    subprocess.run("pkill -f zed_video_capture", shell=True)
+
     _photo_proc = _video_proc = None
+
     if not stopped:
         print("  No capture processes were running")
+
+    # Step 3 — wait for OS to fully release the UVC file descriptors
+    print("  Waiting for camera FDs to release...")
+    time.sleep(2)
+
+    # Step 4 — USB reset to force-release any lingering UVC claim
+    print("  Resetting ZED USB device...")
+    reset_cmd = """python3 -c "
+import fcntl, glob, os
+USBDEVFS_RESET = 0x5514
+# Find ZED camera USB device (Stereolabs VID = 0x2b03)
+for path in glob.glob('/dev/bus/usb/*/*'):
+    try:
+        fd = open(path, 'wb')
+        fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+        fd.close()
+    except Exception:
+        pass
+print('USB reset attempted')
+" 2>/dev/null || true"""
+    subprocess.run(reset_cmd, shell=True)
+
+    # Step 5 — short settle time after USB reset
+    time.sleep(1)
+
+    print("  ✓ Capture stopped, camera released, files saved")
     send_status(STATUS_CAPTURE_STOPPED)
 
 

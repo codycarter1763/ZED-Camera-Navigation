@@ -1,231 +1,98 @@
-# #!/usr/bin/env python3
-# """
-# zed_video_capture.py - ZED Video Recording with Quality Settings
-
-# Records video from ZED camera during flight with configurable quality.
-
-# Usage:
-#     python3 zed_video_capture.py [LOW|MEDIUM|HIGH|ULTRA]
-    
-# Output:
-#     - ~/ZED Navigation/ZED-Camera-Navigation/captures/videos/YYYYMMDD_HHMMSS.svo
-# """
-
-# import pyzed.sl as sl
-# import time
-# import os
-# import sys
-
-# # Quality settings
-# QUALITY_PRESETS = {
-#     "LOW": {
-#         "resolution": sl.RESOLUTION.VGA,           # 672x376
-#         "fps": 15,
-#         "compression": sl.SVO_COMPRESSION_MODE.H265,
-#         "bitrate": 2000  # kbps
-#     },
-#     "MEDIUM": {
-#         "resolution": sl.RESOLUTION.HD720,         # 1280x720
-#         "fps": 30,
-#         "compression": sl.SVO_COMPRESSION_MODE.H265,
-#         "bitrate": 4000
-#     },
-#     "HIGH": {
-#         "resolution": sl.RESOLUTION.HD1080,        # 1920x1080
-#         "fps": 30,
-#         "compression": sl.SVO_COMPRESSION_MODE.H264,
-#         "bitrate": 8000
-#     },
-#     "ULTRA": {
-#         "resolution": sl.RESOLUTION.HD2K,          # 2208x1242
-#         "fps": 30,
-#         "compression": sl.SVO_COMPRESSION_MODE.H264,
-#         "bitrate": 12000
-#     }
-# }
-
-# # Output directory
-# BASE_DIR = os.path.expanduser('~/ZED Navigation/ZED-Camera-Navigation')
-# VIDEOS_DIR = os.path.join(BASE_DIR, 'captures', 'videos')
-
-
-# def main():
-#     # Parse quality setting
-#     quality = sys.argv[1] if len(sys.argv) > 1 else "HIGH"
-#     quality = quality.upper()
-    
-#     if quality not in QUALITY_PRESETS:
-#         print(f"Invalid quality: {quality}")
-#         print(f"Options: {', '.join(QUALITY_PRESETS.keys())}")
-#         sys.exit(1)
-    
-#     preset = QUALITY_PRESETS[quality]
-    
-#     print("=" * 50)
-#     print("  ZED VIDEO RECORDING")
-#     print("=" * 50)
-#     print(f"Quality: {quality}")
-#     print(f"Resolution: {preset['resolution']}")
-#     print(f"FPS: {preset['fps']}")
-#     print(f"Compression: {preset['compression']}")
-#     print(f"Bitrate: {preset['bitrate']} kbps")
-#     print("=" * 50)
-    
-#     # Create output directory
-#     os.makedirs(VIDEOS_DIR, exist_ok=True)
-    
-#     # Initialize ZED
-#     print("\nInitializing ZED camera...")
-#     zed = sl.Camera()
-    
-#     init_params = sl.InitParameters()
-#     init_params.camera_resolution = preset['resolution']
-#     init_params.camera_fps = preset['fps']
-#     init_params.depth_mode = sl.DEPTH_MODE.NONE  # No depth for video
-    
-#     err = zed.open(init_params)
-#     if err != sl.ERROR_CODE.SUCCESS:
-#         print(f"ERROR: Failed to open ZED: {err}")
-#         sys.exit(1)
-    
-#     print("✓ Camera opened")
-    
-#     # Setup recording
-#     print("\nStarting recording...")
-#     timestamp = time.strftime("%Y%m%d_%H%M%S")
-#     video_path = os.path.join(VIDEOS_DIR, f"{timestamp}.svo")
-    
-#     recording_params = sl.RecordingParameters()
-#     recording_params.compression_mode = preset['compression']
-#     recording_params.video_filename = video_path
-#     recording_params.bitrate = preset['bitrate']
-    
-#     err = zed.enable_recording(recording_params)
-#     if err != sl.ERROR_CODE.SUCCESS:
-#         print(f"ERROR: Failed to start recording: {err}")
-#         zed.close()
-#         sys.exit(1)
-    
-#     print(f"✓ Recording to: {video_path}")
-    
-#     # Runtime parameters
-#     runtime_params = sl.RuntimeParameters()
-    
-#     print("\nRECORDING...")
-#     print("Press Ctrl+C to stop\n")
-    
-#     frame_count = 0
-#     start_time = time.time()
-    
-#     try:
-#         while True:
-#             err = zed.grab(runtime_params)
-            
-#             if err == sl.ERROR_CODE.SUCCESS:
-#                 frame_count += 1
-                
-#                 # Print status every 30 frames
-#                 if frame_count % 30 == 0:
-#                     elapsed = time.time() - start_time
-#                     fps = frame_count / elapsed if elapsed > 0 else 0
-#                     duration_min = elapsed / 60
-                    
-#                     print(f"  Frames: {frame_count:5d} | "
-#                           f"FPS: {fps:5.1f} | "
-#                           f"Duration: {duration_min:.1f}m")
-            
-#             time.sleep(0.001)
-            
-#     except KeyboardInterrupt:
-#         print(f"\n\nStopping...")
-    
-#     # Summary
-#     elapsed = time.time() - start_time
-#     duration_min = elapsed / 60
-    
-#     print("\n" + "=" * 50)
-#     print("RECORDING COMPLETE")
-#     print("=" * 50)
-#     print(f"Duration: {duration_min:.2f} minutes")
-#     print(f"Frames: {frame_count}")
-#     print(f"Average FPS: {frame_count/elapsed:.1f}")
-#     print(f"File: {video_path}")
-    
-#     # Get file size if it exists
-#     try:
-#         if os.path.exists(video_path):
-#             file_size = os.path.getsize(video_path) / (1024*1024)
-#             print(f"Size: {file_size:.1f} MB")
-#         else:
-#             print("Size: File still being written...")
-#     except Exception as e:
-#         print(f"Size: Unable to determine ({e})")
-    
-#     print("=" * 50)
-    
-#     zed.disable_recording()
-#     zed.close()
-
-# if __name__ == "__main__":
-#     main()
-
-
-
-
-
-
-
-
-#REMOTE
 #!/usr/bin/env python3
 """
-zed_video_capture.py - ZED Video Recording with Quality Settings
+zed_video_capture.py - ZED Video Recording via ROS2 Topics
 
-Records video from ZED camera during flight with configurable quality.
+Records video from the running ZED ROS2 wrapper with configurable quality.
+Subscribes to /zed/zed_node/rgb/image_rect_color topic.
 
 Usage:
     python3 zed_video_capture.py [LOW|MEDIUM|HIGH|ULTRA]
     
 Output:
-    - ~/ZED Navigation/ZED-Camera-Navigation/captures/videos/YYYYMMDD_HHMMSS.svo
+    - ~/ZED Navigation/ZED-Camera-Navigation/captures/videos/YYYYMMDD_HHMMSS.avi
 """
 
-import pyzed.sl as sl
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
 import time
 import os
 import sys
+import threading
+import signal
 
 # Quality settings
 QUALITY_PRESETS = {
     "LOW": {
-        "resolution": sl.RESOLUTION.VGA,           # 672x376
         "fps": 15,
-        "compression": sl.SVO_COMPRESSION_MODE.H265,
-        "bitrate": 2000  # kbps
+        "bitrate": 2000000,  # 2 Mbps
+        "codec": "XVID"  # Software codec
     },
     "MEDIUM": {
-        "resolution": sl.RESOLUTION.HD720,         # 1280x720
         "fps": 30,
-        "compression": sl.SVO_COMPRESSION_MODE.H265,
-        "bitrate": 4000
+        "bitrate": 4000000,  # 4 Mbps
+        "codec": "XVID"  # Software codec
     },
     "HIGH": {
-        "resolution": sl.RESOLUTION.HD1080,        # 1920x1080
         "fps": 30,
-        "compression": sl.SVO_COMPRESSION_MODE.H264,
-        "bitrate": 8000
+        "bitrate": 8000000,  # 8 Mbps
+        "codec": "XVID"  # Software codec
     },
     "ULTRA": {
-        "resolution": sl.RESOLUTION.HD2K,          # 2208x1242
         "fps": 30,
-        "compression": sl.SVO_COMPRESSION_MODE.H264,
-        "bitrate": 12000
+        "bitrate": 12000000,  # 12 Mbps
+        "codec": "XVID"  # Software codec
     }
 }
 
 # Output directory
 BASE_DIR = os.path.expanduser('~/ZED Navigation/ZED-Camera-Navigation')
 VIDEOS_DIR = os.path.join(BASE_DIR, 'captures', 'videos')
+
+# Shared state
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_image = None
+        self.image_count = 0
+        self.running = True
+        self.writer = None
+
+S = State()
+
+
+class VideoCaptureNode(Node):
+    def __init__(self):
+        super().__init__('video_capture')
+        self.bridge = CvBridge()
+        
+        # Subscribe to ZED rectified color image
+        self.subscription = self.create_subscription(
+            Image,
+            '/zed/zed_node/rgb/color/rect/image',
+            self.image_callback,
+            10)
+        
+        self.get_logger().info('Subscribed to /zed/zed_node/rgb/color/rect/image')
+    
+    def image_callback(self, msg):
+        try:
+            # Convert ROS Image to OpenCV format
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            
+            with S.lock:
+                S.last_image = cv_image
+                S.image_count += 1
+                
+                # Write frame to video if writer is active
+                if S.writer is not None:
+                    S.writer.write(cv_image)
+                    
+        except Exception as e:
+            self.get_logger().error(f'Failed to process image: {e}')
 
 
 def main():
@@ -240,56 +107,76 @@ def main():
     
     preset = QUALITY_PRESETS[quality]
     
+    # Signal handler for graceful shutdown
+    def signal_handler(sig, frame):
+        S.running = False
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     print("=" * 50)
-    print("  ZED VIDEO RECORDING")
+    print("  ZED VIDEO RECORDING (ROS2)")
     print("=" * 50)
     print(f"Quality: {quality}")
-    print(f"Resolution: {preset['resolution']}")
     print(f"FPS: {preset['fps']}")
-    print(f"Compression: {preset['compression']}")
-    print(f"Bitrate: {preset['bitrate']} kbps")
+    print(f"Bitrate: {preset['bitrate']/1000000:.1f} Mbps")
+    print(f"Codec: {preset['codec']}")
+    print(f"Topic: /zed/zed_node/rgb/color/rect/image")
     print("=" * 50)
     
     # Create output directory
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     
-    # Initialize ZED
-    print("\nInitializing ZED camera...")
-    zed = sl.Camera()
+    # Initialize ROS2
+    rclpy.init()
+    node = VideoCaptureNode()
     
-    init_params = sl.InitParameters()
-    init_params.camera_resolution = preset['resolution']
-    init_params.camera_fps = preset['fps']
-    init_params.depth_mode = sl.DEPTH_MODE.NONE  # No depth for video
+    # Spin ROS2 in background thread
+    def ros_spin():
+        try:
+            rclpy.spin(node)
+        except ExternalShutdownException:
+            pass  # Normal shutdown, ignore
     
-    err = zed.open(init_params)
-    if err != sl.ERROR_CODE.SUCCESS:
-        print(f"ERROR: Failed to open ZED: {err}")
-        sys.exit(1)
+    ros_thread = threading.Thread(target=ros_spin, daemon=True)
+    ros_thread.start()
     
-    print("✓ Camera opened")
+    # Wait for first image
+    print("\nWaiting for images from ZED...")
+    time.sleep(2)
     
-    # Setup recording
-    print("\nStarting recording...")
+    with S.lock:
+        if S.last_image is None:
+            print("ERROR: No images received from ZED!")
+            print("Make sure ZED ROS2 wrapper is running.")
+            rclpy.shutdown()
+            sys.exit(1)
+        
+        # Get image dimensions
+        height, width = S.last_image.shape[:2]
+    
+    print(f"✓ Receiving images from ZED ({width}x{height})")
+    
+    # Setup video writer
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    video_path = os.path.join(VIDEOS_DIR, f"{timestamp}.svo")
+    video_path = os.path.join(VIDEOS_DIR, f"{timestamp}.avi")  # .avi for XVID
     
-    recording_params = sl.RecordingParameters()
-    recording_params.compression_mode = preset['compression']
-    recording_params.video_filename = video_path
-    recording_params.bitrate = preset['bitrate']
+    # Define codec
+    fourcc = cv2.VideoWriter_fourcc(*preset['codec'])
     
-    err = zed.enable_recording(recording_params)
-    if err != sl.ERROR_CODE.SUCCESS:
-        print(f"ERROR: Failed to start recording: {err}")
-        zed.close()
+    with S.lock:
+        S.writer = cv2.VideoWriter(
+            video_path,
+            fourcc,
+            preset['fps'],
+            (width, height))
+    
+    if not S.writer.isOpened():
+        print("ERROR: Failed to create video writer!")
+        rclpy.shutdown()
         sys.exit(1)
     
     print(f"✓ Recording to: {video_path}")
-    
-    # Runtime parameters
-    runtime_params = sl.RuntimeParameters()
-    
     print("\nRECORDING...")
     print("Press Ctrl+C to stop\n")
     
@@ -297,26 +184,33 @@ def main():
     start_time = time.time()
     
     try:
-        while True:
-            err = zed.grab(runtime_params)
+        while S.running:
+            with S.lock:
+                current_count = S.image_count
             
-            if err == sl.ERROR_CODE.SUCCESS:
-                frame_count += 1
+            # Print status every 30 frames
+            if current_count > frame_count and current_count % 30 == 0:
+                elapsed = time.time() - start_time
+                fps = current_count / elapsed if elapsed > 0 else 0
+                duration_min = elapsed / 60
                 
-                # Print status every 30 frames
-                if frame_count % 30 == 0:
-                    elapsed = time.time() - start_time
-                    fps = frame_count / elapsed if elapsed > 0 else 0
-                    duration_min = elapsed / 60
-                    
-                    print(f"  Frames: {frame_count:5d} | "
-                          f"FPS: {fps:5.1f} | "
-                          f"Duration: {duration_min:.1f}m")
+                print(f"  Frames: {current_count:5d} | "
+                      f"FPS: {fps:5.1f} | "
+                      f"Duration: {duration_min:.1f}m")
+                
+                frame_count = current_count
             
-            time.sleep(0.001)
+            time.sleep(0.1)
             
     except KeyboardInterrupt:
         print(f"\n\nStopping...")
+        S.running = False
+    
+    # Close video writer
+    with S.lock:
+        if S.writer is not None:
+            S.writer.release()
+            S.writer = None
     
     # Summary
     elapsed = time.time() - start_time
@@ -326,24 +220,27 @@ def main():
     print("RECORDING COMPLETE")
     print("=" * 50)
     print(f"Duration: {duration_min:.2f} minutes")
-    print(f"Frames: {frame_count}")
-    print(f"Average FPS: {frame_count/elapsed:.1f}")
+    
+    with S.lock:
+        print(f"Frames: {S.image_count}")
+        if elapsed > 0:
+            print(f"Average FPS: {S.image_count/elapsed:.1f}")
+    
     print(f"File: {video_path}")
     
-    # Get file size if it exists
+    # Get file size
     try:
         if os.path.exists(video_path):
             file_size = os.path.getsize(video_path) / (1024*1024)
             print(f"Size: {file_size:.1f} MB")
-        else:
-            print("Size: File still being written...")
     except Exception as e:
         print(f"Size: Unable to determine ({e})")
     
     print("=" * 50)
     
-    zed.disable_recording()
-    zed.close()
+    # Cleanup
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
