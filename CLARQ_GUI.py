@@ -493,7 +493,6 @@ class DroneGUI:
 
         # ── Jetson system ─────────────────────────────────────
         section("JETSON")
-        btn("LAUNCH JETSON",     GREEN, self.launch_jetson)
         btn("PING JETSON",       BLUE,  self.ping_jetson)
 
         # ── AprilTag ──────────────────────────────────────────
