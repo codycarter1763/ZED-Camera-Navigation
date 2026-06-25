@@ -400,10 +400,6 @@ class DroneGUI:
         self.jetson_phase_lbl.pack(
             anchor=tk.W, padx=15, pady=(0, 6))
 
-        self.nav_btns = []
-        b = btn("1. SET HOME POINT", GREEN, self.set_home_point)
-        self.nav_btns.append(b)
-
         # Step 2: 3D Fusion with START/STOP
         tk.Label(
             parent, text="2. 3D FUSION SCAN",
@@ -493,15 +489,11 @@ class DroneGUI:
             pady=8, command=self.stop_capture
         ).pack(fill=tk.X, padx=15, pady=(0, 4))
 
-        b = btn("3. SAVE END POINT",  PURPLE, self.save_end_point)
-        self.nav_btns.append(b)
-        b = btn("4. GO HOME + LAND",  WARN,   self.go_home_and_land)
-        self.nav_btns.append(b)
+        btn("GO HOME + LAND",  WARN,   self.go_home_and_land)
 
         # ── Jetson system ─────────────────────────────────────
         section("JETSON")
         btn("LAUNCH JETSON",     GREEN, self.launch_jetson)
-        btn("LAUNCH JETSON SIM", BLUE,  self.launch_jetson_sim)
         btn("KILL JETSON",       RED,   self.kill_jetson)
         btn("PING JETSON",       BLUE,  self.ping_jetson)
 
@@ -566,7 +558,6 @@ class DroneGUI:
 
         self.arm_btn       = btn("ARM",       GREEN, self.arm,       tk.DISABLED)
         self.disarm_btn    = btn("DISARM",    RED,   self.disarm,    tk.DISABLED)
-        self.force_arm_btn = btn("FORCE ARM", WARN,  self.force_arm, tk.DISABLED)
 
         # ── Commands ──────────────────────────────────────────
         section("COMMANDS")
@@ -673,7 +664,6 @@ class DroneGUI:
             b.config(state=tk.NORMAL)
         self.arm_btn.config(state=tk.NORMAL)
         self.disarm_btn.config(state=tk.NORMAL)
-        self.force_arm_btn.config(state=tk.NORMAL)
 
     # ═══════════════════════════════════════════════════════════
     # NRF / ARDUINO SERIAL CONNECTION
